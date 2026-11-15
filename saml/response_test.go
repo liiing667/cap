@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/beevik/etree"
 	"github.com/jonboulle/clockwork"
 	saml2 "github.com/russellhaering/gosaml2"
 	"github.com/stretchr/testify/assert"
@@ -826,10 +827,10 @@ NBp9UZome44qZAYH1iqrpmmjsfI9pJItsgWu3kXPjhSfj1AJGR1l9JGvJrHki1iHTA==</ds:X509Cer
 			</saml2:Assertion>
 	</saml2p:Response>`
 
-// TestServiceProvider_ParseResponseAcceptsSignedAssertionWithTamperedUnsignedResponseInResponseTo
+// TestServiceProvider_ParseResponseRejectsSignedAssertionWithTamperedUnsignedResponseInResponseTo
 // verifies that SAML responses with stale assertions cannot correlate to fresh
 // requests.
-func TestServiceProvider_ParseResponseAcceptsSignedAssertionWithTamperedUnsignedResponseInResponseTo(t *testing.T) {
+func TestServiceProvider_ParseResponseRejectsSignedAssertionWithTamperedUnsignedResponseInResponseTo(t *testing.T) {
 	tp := testprovider.StartTestProvider(t)
 	defer tp.Close()
 
@@ -883,4 +884,189 @@ func TestServiceProvider_ParseResponseAcceptsSignedAssertionWithTamperedUnsigned
 		_, err := sp.ParseResponse(encoded, freshRequestID, saml.ValidateResponseSignature())
 		require.Error(t, err)
 	})
+}
+
+func TestServiceProvider_ParseResponseBindingValidation(t *testing.T) {
+	t.Parallel()
+
+	const (
+		entityID  = "http://hashicorp-cap.test"
+		acsURL    = "http://hashicorp-cap.test/saml/acs"
+		requestID = "test-request-id"
+	)
+
+	tp := testprovider.StartTestProvider(t)
+	defer tp.Close()
+
+	cfg, err := saml.NewConfig(entityID, acsURL, fmt.Sprintf("%s/saml/metadata", tp.ServerURL()))
+	require.NoError(t, err)
+	sp, err := saml.NewServiceProvider(cfg)
+	require.NoError(t, err)
+
+	type responseMode struct {
+		name string
+		opts []testprovider.ResponseOption
+	}
+
+	responseModes := []responseMode{
+		{
+			name: "assertion signed",
+			opts: []testprovider.ResponseOption{testprovider.WithJustAssertionSigned()},
+		},
+		{
+			name: "response and assertion signed",
+			opts: []testprovider.ResponseOption{testprovider.WithResponseAndAssertionSigned()},
+		},
+	}
+
+	mutators := []struct {
+		name    string
+		mutate  func(*etree.Document)
+		wantErr string
+	}{
+		{
+			name: "missing response request binding",
+			mutate: func(doc *etree.Document) {
+				doc.Root().RemoveAttr("InResponseTo")
+			},
+			wantErr: "missing Response.InResponseTo",
+		},
+		{
+			name: "conflicting response request binding",
+			mutate: func(doc *etree.Document) {
+				doc.Root().SelectAttr("InResponseTo").Value = "different-request-id"
+			},
+			wantErr: "Response.InResponseTo (different-request-id) doesn't match",
+		},
+		{
+			name: "missing subject confirmation request binding",
+			mutate: func(doc *etree.Document) {
+				findElement(doc.Root(), "SubjectConfirmationData").RemoveAttr("InResponseTo")
+			},
+			wantErr: "missing SubjectConfirmationData.InResponseTo",
+		},
+		{
+			name: "conflicting subject confirmation request binding",
+			mutate: func(doc *etree.Document) {
+				findElement(doc.Root(), "SubjectConfirmationData").SelectAttr("InResponseTo").Value = "different-request-id"
+			},
+			wantErr: "SubjectConfirmationData.InResponseTo (different-request-id) doesn't match",
+		},
+		{
+			name: "missing subject confirmation",
+			mutate: func(doc *etree.Document) {
+				subject := findElement(doc.Root(), "Subject")
+				subject.RemoveChild(findElement(subject, "SubjectConfirmation"))
+			},
+			wantErr: "missing SubjectConfirmation element",
+		},
+		{
+			name: "duplicate subject confirmation",
+			mutate: func(doc *etree.Document) {
+				subject := findElement(doc.Root(), "Subject")
+				subject.AddChild(findElement(subject, "SubjectConfirmation").Copy())
+			},
+			wantErr: "missing or duplicate SubjectConfirmation",
+		},
+		{
+			name: "duplicate subject confirmation data",
+			mutate: func(doc *etree.Document) {
+				subjectConfirmation := findElement(doc.Root(), "SubjectConfirmation")
+				subjectConfirmation.AddChild(findElement(subjectConfirmation, "SubjectConfirmationData").Copy())
+			},
+			wantErr: "missing or duplicate SubjectConfirmationData",
+		},
+		{
+			name: "unsupported subject confirmation method",
+			mutate: func(doc *etree.Document) {
+				findElement(doc.Root(), "SubjectConfirmation").SelectAttr("Method").Value = "urn:oasis:names:tc:SAML:2.0:cm:sender-vouches"
+			},
+			wantErr: "Unsupported SubjectConfirmation value",
+		},
+		{
+			name: "missing audience restriction",
+			mutate: func(doc *etree.Document) {
+				conditions := findElement(doc.Root(), "Conditions")
+				conditions.RemoveChild(findElement(conditions, "AudienceRestriction"))
+			},
+			wantErr: "missing or duplicate AudienceRestriction",
+		},
+		{
+			name: "duplicate audience restriction",
+			mutate: func(doc *etree.Document) {
+				conditions := findElement(doc.Root(), "Conditions")
+				conditions.AddChild(findElement(conditions, "AudienceRestriction").Copy())
+			},
+			wantErr: "missing or duplicate AudienceRestriction",
+		},
+		{
+			name: "duplicate audience",
+			mutate: func(doc *etree.Document) {
+				audienceRestriction := findElement(doc.Root(), "AudienceRestriction")
+				audienceRestriction.AddChild(findElement(audienceRestriction, "Audience").Copy())
+			},
+			wantErr: "missing or duplicate Audience",
+		},
+		{
+			name: "conflicting audience",
+			mutate: func(doc *etree.Document) {
+				findElement(doc.Root(), "Audience").SetText("http://other-sp.example")
+			},
+			wantErr: "invalid audience",
+		},
+	}
+
+	for _, mode := range responseModes {
+		for _, tc := range mutators {
+			t.Run(mode.name+"/"+tc.name, func(t *testing.T) {
+				raw := tp.SamlResponse(t, mode.opts...)
+				doc := etree.NewDocument()
+				require.NoError(t, doc.ReadFromString(raw))
+				tc.mutate(doc)
+				mutated, err := doc.WriteToString()
+				require.NoError(t, err)
+				require.NotEqual(t, raw, mutated)
+
+				_, err = sp.ParseResponse(
+					base64.StdEncoding.EncodeToString([]byte(mutated)),
+					requestID,
+					saml.InsecureSkipSignatureValidation(),
+				)
+				require.Error(t, err)
+				require.ErrorContains(t, err, tc.wantErr)
+			})
+		}
+	}
+
+	t.Run("signed policy rejects binding conflicts", func(t *testing.T) {
+		raw := tp.SamlResponse(t, testprovider.WithJustAssertionSigned())
+		doc := etree.NewDocument()
+		require.NoError(t, doc.ReadFromString(raw))
+		doc.Root().SelectAttr("InResponseTo").Value = "different-request-id"
+		mutated, err := doc.WriteToString()
+		require.NoError(t, err)
+
+		for _, opts := range [][]saml.Option{
+			nil,
+			{saml.ValidateAssertionSignature()},
+		} {
+			_, err = sp.ParseResponse(base64.StdEncoding.EncodeToString([]byte(mutated)), requestID, opts...)
+			require.Error(t, err)
+			require.ErrorContains(t, err, "Response.InResponseTo (different-request-id) doesn't match")
+		}
+	})
+}
+
+func findElement(element *etree.Element, tag string) *etree.Element {
+	const assertionNamespace = "urn:oasis:names:tc:SAML:2.0:assertion"
+	for _, child := range element.ChildElements() {
+		if child.Tag == tag && child.NamespaceURI() == assertionNamespace {
+			return child
+		}
+		if found := findElement(child, tag); found != nil {
+			return found
+		}
+	}
+
+	return nil
 }

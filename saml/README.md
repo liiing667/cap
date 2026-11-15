@@ -58,3 +58,14 @@ required signature policy is controlled by options:
     signed, each assertion must be signed and valid.
 - Using both options requires a valid response signature and validates any
     assertion signatures that are present.
+
+## ParseResponse request binding validation
+
+`ParseResponse` requires the SP request ID to match both `Response.InResponseTo`
+and bearer `SubjectConfirmationData.InResponseTo`. It also requires exactly one
+bearer subject confirmation, one audience restriction, and one audience matching
+the SP entity ID. Missing, duplicate, or conflicting values cause response
+validation to fail.
+The insecure request-ID and assertion-condition skip options retain their
+existing opt-out behavior for callers that use them for testing or specialized
+SAML deployments.

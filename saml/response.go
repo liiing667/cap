@@ -10,13 +10,21 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strings"
 
+	"github.com/beevik/etree"
 	"github.com/jonboulle/clockwork"
 	saml2 "github.com/russellhaering/gosaml2"
 	dsig "github.com/russellhaering/goxmldsig"
 
 	"github.com/hashicorp/cap/saml/models/core"
 	"github.com/hashicorp/cap/saml/models/metadata"
+)
+
+const (
+	samlAssertionNamespace = "urn:oasis:names:tc:SAML:2.0:assertion"
+	samlProtocolNamespace  = "urn:oasis:names:tc:SAML:2.0:protocol"
+	bearerConfirmation     = "urn:oasis:names:tc:SAML:2.0:cm:bearer"
 )
 
 type parseResponseOptions struct {
@@ -154,6 +162,23 @@ func (sp *ServiceProvider) ParseResponse(
 		// no assertions, but we've left this here since it's a required for our
 		// implementation as well.
 		return nil, fmt.Errorf("%s: %w", op, ErrMissingAssertions)
+	}
+
+	samlResponse := core.Response{Response: *response}
+	if opts.validateResponseSignature || opts.validateAssertionSignature {
+		// func ip.ValidateEncodedResponse(...) above only requires either `response or all its `assertions` are signed,
+		// but does not require both. The validateSignature function will validate either response or assertion
+		// or both is surely signed depending on the parse response options given.
+		if err := validateSignature(&samlResponse, op, opts); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := validateResponseBindings(samlResp, requestID, sp.cfg.EntityID, opts); err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+
+	switch {
 	case !opts.skipRequestIDValidation && response.InResponseTo != requestID:
 		return nil, fmt.Errorf(
 			"InResponseTo (%s) doesn't match the expected requestID (%s)",
@@ -181,27 +206,9 @@ func (sp *ServiceProvider) ParseResponse(
 				// there isn't a subject, but we've left this here since it's a
 				// required for our implementation as well.
 				return nil, fmt.Errorf("%s: %w", op, ErrMissingSubject)
-			case assert.Subject.SubjectConfirmation != nil &&
-				assert.Subject.SubjectConfirmation.SubjectConfirmationData != nil &&
-				assert.Subject.SubjectConfirmation.SubjectConfirmationData.InResponseTo != requestID:
-				return nil, fmt.Errorf(
-					"SubjectConfirmationData.InResponseTo (%s) doesn't match the expected requestID (%s)",
-					assert.Subject.SubjectConfirmation.SubjectConfirmationData.InResponseTo,
-					requestID,
-				)
 			case assert.AttributeStatement == nil:
 				return nil, fmt.Errorf("%s: %w", op, ErrMissingAttributeStmt)
 			}
-		}
-	}
-
-	samlResponse := core.Response{Response: *response}
-	if opts.validateResponseSignature || opts.validateAssertionSignature {
-		// func ip.ValidateEncodedResponse(...) above only requires either `response or all its `assertions` are signed,
-		// but does not require both. The validateSignature function will validate either response or assertion
-		// or both is surely signed depending on the parse response options given.
-		if err := validateSignature(&samlResponse, op, opts); err != nil {
-			return nil, err
 		}
 	}
 
@@ -298,6 +305,124 @@ func parsePEMCertificate(cert []byte) (*x509.Certificate, error) {
 	}
 
 	return x509.ParseCertificate(block.Bytes)
+}
+
+func validateResponseBindings(encodedResponse, requestID, audience string, opts parseResponseOptions) error {
+	rawResponse, err := base64.StdEncoding.DecodeString(encodedResponse)
+	if err != nil {
+		return fmt.Errorf("unable to decode response: %w", ErrInvalidParameter)
+	}
+
+	doc := etree.NewDocument()
+	if err := doc.ReadFromBytes(rawResponse); err != nil {
+		return fmt.Errorf("unable to parse response bindings: %w", ErrInvalidParameter)
+	}
+
+	responseElement := doc.Root()
+	if responseElement == nil || responseElement.Tag != "Response" || responseElement.NamespaceURI() != samlProtocolNamespace {
+		return fmt.Errorf("missing SAML response: %w", ErrInvalidParameter)
+	}
+
+	if !opts.skipRequestIDValidation {
+		responseRequestID := responseElement.SelectAttrValue("InResponseTo", "")
+		if responseRequestID == "" {
+			return fmt.Errorf("missing Response.InResponseTo: %w", ErrInvalidParameter)
+		}
+		if responseRequestID != requestID {
+			return fmt.Errorf(
+				"Response.InResponseTo (%s) doesn't match the expected requestID (%s): %w",
+				responseRequestID,
+				requestID,
+				ErrInvalidParameter,
+			)
+		}
+	}
+
+	assertions := childElements(responseElement, "Assertion", samlAssertionNamespace)
+	if len(assertions) == 0 {
+		return fmt.Errorf("missing assertions: %w", ErrMissingAssertions)
+	}
+
+	for _, assertion := range assertions {
+		if err := validateAssertionBindings(assertion, requestID, audience, opts); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateAssertionBindings inspects the raw assertion instead of the typed
+// assertion so repeated elements cannot hide a conflicting or duplicate value.
+func validateAssertionBindings(assertion *etree.Element, requestID, audience string, opts parseResponseOptions) error {
+	subjects := childElements(assertion, "Subject", samlAssertionNamespace)
+	if len(subjects) != 1 {
+		return fmt.Errorf("subject missing: %w", ErrMissingSubject)
+	}
+
+	subjectConfirmations := childElements(subjects[0], "SubjectConfirmation", samlAssertionNamespace)
+	if len(subjectConfirmations) != 1 {
+		return fmt.Errorf("missing or duplicate SubjectConfirmation: %w", ErrInvalidParameter)
+	}
+
+	subjectConfirmation := subjectConfirmations[0]
+	if subjectConfirmation.SelectAttrValue("Method", "") != bearerConfirmation {
+		return fmt.Errorf("unsupported SubjectConfirmation method: %w", ErrInvalidParameter)
+	}
+
+	subjectConfirmationDataElements := childElements(subjectConfirmation, "SubjectConfirmationData", samlAssertionNamespace)
+	if len(subjectConfirmationDataElements) != 1 {
+		return fmt.Errorf("missing or duplicate SubjectConfirmationData: %w", ErrInvalidParameter)
+	}
+
+	if !opts.skipRequestIDValidation {
+		subjectRequestID := subjectConfirmationDataElements[0].SelectAttrValue("InResponseTo", "")
+		if subjectRequestID == "" {
+			return fmt.Errorf("missing SubjectConfirmationData.InResponseTo: %w", ErrInvalidParameter)
+		}
+		if subjectRequestID != requestID {
+			return fmt.Errorf(
+				"SubjectConfirmationData.InResponseTo (%s) doesn't match the expected requestID (%s): %w",
+				subjectRequestID,
+				requestID,
+				ErrInvalidParameter,
+			)
+		}
+	}
+
+	if !opts.skipAssertionConditionValidation {
+		conditions := childElements(assertion, "Conditions", samlAssertionNamespace)
+		if len(conditions) != 1 {
+			return fmt.Errorf("missing or duplicate Conditions: %w", ErrInvalidAudience)
+		}
+
+		audienceRestrictions := childElements(conditions[0], "AudienceRestriction", samlAssertionNamespace)
+		if len(audienceRestrictions) != 1 {
+			return fmt.Errorf("missing or duplicate AudienceRestriction: %w", ErrInvalidAudience)
+		}
+
+		audiences := childElements(audienceRestrictions[0], "Audience", samlAssertionNamespace)
+		if len(audiences) != 1 {
+			return fmt.Errorf("missing or duplicate Audience: %w", ErrInvalidAudience)
+		}
+
+		if strings.TrimSpace(audiences[0].Text()) != audience {
+			return fmt.Errorf("invalid audience: %w", ErrInvalidAudience)
+		}
+	}
+
+	return nil
+}
+
+func childElements(element *etree.Element, tag, namespace string) []*etree.Element {
+	var matches []*etree.Element
+	for _, child := range element.ChildElements() {
+		if child.Tag == tag && child.NamespaceURI() == namespace {
+			matches = append(matches, child)
+		}
+	}
+
+	return matches
 }
 
 func validateSignature(response *core.Response, op string, opts parseResponseOptions) error {
