@@ -164,6 +164,29 @@ func (p *Provider) ConfigHash() (uint64, error) {
 	return p.config.Hash()
 }
 
+// freezeRequest asks optional Request implementations to capture their
+// immutable authentication parameters.  The different signatures keep this
+// helper compatible with both the built-in *Req and simple external Request
+// wrappers.
+func freezeRequest(oidcRequest Request) error {
+	switch r := oidcRequest.(type) {
+	case interface{ Freeze() error }:
+		if err := r.Freeze(); err != nil {
+			return err
+		}
+	case interface{ Freeze() }:
+		r.Freeze()
+	case interface{ Freeze() uint64 }:
+		r.Freeze()
+	}
+	// Capture the generation associated with this initiation.  Request
+	// implementations which do not expose a generation simply use zero.
+	if generation, ok := oidcRequest.(RequestGeneration); ok {
+		_ = generation.Generation()
+	}
+	return nil
+}
+
 // AuthURL will generate a URL the caller can use to kick off an OIDC
 // authorization code (with optional PKCE) or an implicit flow with an IdP.
 //
@@ -171,29 +194,51 @@ func (p *Provider) ConfigHash() (uint64, error) {
 // will uniquely identify the user's authentication attempt throughout the flow.
 func (p *Provider) AuthURL(ctx context.Context, oidcRequest Request) (url string, e error) {
 	const op = "Provider.AuthURL"
-	if oidcRequest.State() == "" {
+	if oidcRequest == nil {
+		return "", fmt.Errorf("%s: request is nil: %w", op, ErrNilParameter)
+	}
+	if err := freezeRequest(oidcRequest); err != nil {
+		return "", fmt.Errorf("%s: unable to freeze authentication request: %w", op, err)
+	}
+
+	// Capture every request value used to build the URL exactly once.  A
+	// Request implementation may be stateful, so reading its methods more than
+	// once can create a mismatch between the values that were validated and
+	// the values placed in the authorization URL.
+	requestState := oidcRequest.State()
+	requestNonce := oidcRequest.Nonce()
+	verifier := oidcRequest.PKCEVerifier()
+	withImplicit, withImplicitAccessToken := oidcRequest.ImplicitFlow()
+	redirectURL := oidcRequest.RedirectURL()
+	scopes := oidcRequest.Scopes()
+	maxAgeSeconds, maxAgeAuthAfter := oidcRequest.MaxAge()
+	requestPrompts := oidcRequest.Prompts()
+	requestDisplay := oidcRequest.Display()
+	requestUILocales := oidcRequest.UILocales()
+	requestClaims := oidcRequest.Claims()
+	requestACRValues := oidcRequest.ACRValues()
+
+	if requestState == "" {
 		return "", fmt.Errorf("%s: request id is empty: %w", op, ErrInvalidParameter)
 	}
-	if oidcRequest.Nonce() == "" {
+	if requestNonce == "" {
 		return "", fmt.Errorf("%s: request nonce is empty: %w", op, ErrInvalidParameter)
 	}
-	if oidcRequest.State() == oidcRequest.Nonce() {
+	if requestState == requestNonce {
 		return "", fmt.Errorf("%s: request id and nonce cannot be equal: %w", op, ErrInvalidParameter)
 	}
-	withImplicit, withImplicitAccessToken := oidcRequest.ImplicitFlow()
-	if oidcRequest.PKCEVerifier() != nil && withImplicit {
+	if verifier != nil && withImplicit {
 		return "", fmt.Errorf("%s: request requests both implicit flow and authorization code with PKCE: %w", op, ErrInvalidParameter)
 	}
-	if oidcRequest.RedirectURL() == "" {
+	if redirectURL == "" {
 		return "", fmt.Errorf("%s: request redirect URL is empty: %w", op, ErrInvalidParameter)
 	}
-	if err := p.validRedirect(oidcRequest.RedirectURL()); err != nil {
+	if err := p.validRedirect(redirectURL); err != nil {
 		return "", fmt.Errorf("%s: %w", op, err)
 	}
-	var scopes []string
 	switch {
-	case len(oidcRequest.Scopes()) > 0:
-		scopes = oidcRequest.Scopes()
+	case len(scopes) > 0:
+		// use the request's scopes captured above
 	default:
 		scopes = p.config.Scopes
 	}
@@ -206,12 +251,12 @@ func (p *Provider) AuthURL(ctx context.Context, oidcRequest Request) (url string
 	oauth2Config := oauth2.Config{
 		ClientID:     p.config.ClientID,
 		ClientSecret: string(p.config.ClientSecret),
-		RedirectURL:  oidcRequest.RedirectURL(),
+		RedirectURL:  redirectURL,
 		Endpoint:     p.provider.Endpoint(),
 		Scopes:       scopes,
 	}
 	authCodeOpts := []oauth2.AuthCodeOption{
-		oidc.Nonce(oidcRequest.Nonce()),
+		oidc.Nonce(requestNonce),
 	}
 	if withImplicit {
 		reqTokens := []string{"id_token"}
@@ -220,15 +265,15 @@ func (p *Provider) AuthURL(ctx context.Context, oidcRequest Request) (url string
 		}
 		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("response_mode", "form_post"), oauth2.SetAuthURLParam("response_type", strings.Join(reqTokens, " ")))
 	}
-	if oidcRequest.PKCEVerifier() != nil {
-		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("code_challenge", oidcRequest.PKCEVerifier().Challenge()), oauth2.SetAuthURLParam("code_challenge_method", string(oidcRequest.PKCEVerifier().Method())))
+	if verifier != nil {
+		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("code_challenge", verifier.Challenge()), oauth2.SetAuthURLParam("code_challenge_method", string(verifier.Method())))
 	}
-	if secs, exp := oidcRequest.MaxAge(); !exp.IsZero() {
-		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("max_age", strconv.Itoa(int(secs))))
+	if !maxAgeAuthAfter.IsZero() {
+		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("max_age", strconv.Itoa(int(maxAgeSeconds))))
 	}
-	if len(oidcRequest.Prompts()) > 0 {
-		prompts := make([]string, 0, len(oidcRequest.Prompts()))
-		for _, v := range oidcRequest.Prompts() {
+	if len(requestPrompts) > 0 {
+		prompts := make([]string, 0, len(requestPrompts))
+		for _, v := range requestPrompts {
 			prompts = append(prompts, string(v))
 		}
 		prompts = strutils.RemoveDuplicatesStable(prompts, false)
@@ -237,23 +282,23 @@ func (p *Provider) AuthURL(ctx context.Context, oidcRequest Request) (url string
 		}
 		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("prompt", strings.Join(prompts, " ")))
 	}
-	if oidcRequest.Display() != "" {
-		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("display", string(oidcRequest.Display())))
+	if requestDisplay != "" {
+		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("display", string(requestDisplay)))
 	}
-	if len(oidcRequest.UILocales()) > 0 {
-		locales := make([]string, 0, len(oidcRequest.UILocales()))
-		for _, l := range oidcRequest.UILocales() {
+	if len(requestUILocales) > 0 {
+		locales := make([]string, 0, len(requestUILocales))
+		for _, l := range requestUILocales {
 			locales = append(locales, string(l.String()))
 		}
 		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("ui_locales", strings.Join(locales, " ")))
 	}
-	if len(oidcRequest.Claims()) > 0 {
-		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("claims", string(oidcRequest.Claims())))
+	if len(requestClaims) > 0 {
+		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("claims", string(requestClaims)))
 	}
-	if len(oidcRequest.ACRValues()) > 0 {
-		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("acr_values", strings.Join(oidcRequest.ACRValues(), " ")))
+	if len(requestACRValues) > 0 {
+		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("acr_values", strings.Join(requestACRValues, " ")))
 	}
-	return oauth2Config.AuthCodeURL(oidcRequest.State(), authCodeOpts...), nil
+	return oauth2Config.AuthCodeURL(requestState, authCodeOpts...), nil
 }
 
 // Exchange will request a token from the oidc token endpoint, using the
@@ -284,20 +329,39 @@ func (p *Provider) Exchange(ctx context.Context, oidcRequest Request, authorizat
 	if oidcRequest == nil {
 		return nil, fmt.Errorf("%s: request is nil: %w", op, ErrNilParameter)
 	}
+
+	// Capture the request values used by this exchange exactly once.  A
+	// Request implementation may be stateful, and the state/PKCE values must
+	// not change between validation and the token request.
+	requestState := oidcRequest.State()
+	redirectURL := oidcRequest.RedirectURL()
+	requestScopes := oidcRequest.Scopes()
+	verifier := oidcRequest.PKCEVerifier()
+	clientAssertion := oidcRequest.ClientAssertionJWT()
+
 	if withImplicit, _ := oidcRequest.ImplicitFlow(); withImplicit {
-		return nil, fmt.Errorf("%s: request (%s) should not be using the implicit flow: %w", op, oidcRequest.State(), ErrInvalidFlow)
+		return nil, fmt.Errorf("%s: request (%s) should not be using the implicit flow: %w", op, requestState, ErrInvalidFlow)
 	}
-	if oidcRequest.State() != authorizationState {
+	if requestState != authorizationState {
 		return nil, fmt.Errorf("%s: authentication request state and authorization state are not equal: %w", op, ErrInvalidParameter)
 	}
-	if oidcRequest.RedirectURL() == "" {
+	if redirectURL == "" {
 		return nil, fmt.Errorf("%s: authentication request redirect URL is empty: %w", op, ErrInvalidParameter)
 	}
-	if err := p.validRedirect(oidcRequest.RedirectURL()); err != nil {
+	if err := p.validRedirect(redirectURL); err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 	if oidcRequest.IsExpired() {
 		return nil, fmt.Errorf("%s: authentication request is expired: %w", op, ErrInvalidParameter)
+	}
+	// A request which has started an authorization flow may only be exchanged
+	// once.  Requests which are used directly with Exchange without ever
+	// calling AuthURL retain the historical stateless behavior and are not
+	// consumed here.
+	if consumer, ok := oidcRequest.(RequestExchangeConsumer); ok {
+		if err := consumer.ConsumeExchange(); err != nil {
+			return nil, fmt.Errorf("%s: unable to consume authorization request: %w", op, err)
+		}
 	}
 
 	oidcCtx, err := p.HTTPClientContext(ctx)
@@ -306,8 +370,8 @@ func (p *Provider) Exchange(ctx context.Context, oidcRequest Request, authorizat
 	}
 	var scopes []string
 	switch {
-	case len(oidcRequest.Scopes()) > 0:
-		scopes = oidcRequest.Scopes()
+	case len(requestScopes) > 0:
+		scopes = requestScopes
 	default:
 		scopes = p.config.Scopes
 	}
@@ -316,18 +380,18 @@ func (p *Provider) Exchange(ctx context.Context, oidcRequest Request, authorizat
 	oauth2Config := oauth2.Config{
 		ClientID:     p.config.ClientID,
 		ClientSecret: string(p.config.ClientSecret),
-		RedirectURL:  oidcRequest.RedirectURL(),
+		RedirectURL:  redirectURL,
 		Endpoint:     p.provider.Endpoint(),
 		Scopes:       scopes,
 	}
 	var authCodeOpts []oauth2.AuthCodeOption
-	if oidcRequest.PKCEVerifier() != nil {
-		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("code_verifier", oidcRequest.PKCEVerifier().Verifier()))
+	if verifier != nil {
+		authCodeOpts = append(authCodeOpts, oauth2.SetAuthURLParam("code_verifier", verifier.Verifier()))
 	}
-	if oidcRequest.ClientAssertionJWT() != nil {
+	if clientAssertion != nil {
 		// by now, sufficient validation should have already occurred to prevent
 		// errors here, but err check again just in case.
-		token, err := oidcRequest.ClientAssertionJWT().Serialize()
+		token, err := clientAssertion.Serialize()
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", op, err)
 		}
@@ -510,8 +574,22 @@ func (p *Provider) VerifyIDToken(ctx context.Context, t IDToken, oidcRequest Req
 	if t == "" {
 		return nil, fmt.Errorf("%s: id_token is empty: %w", op, ErrInvalidParameter)
 	}
-	if oidcRequest.Nonce() == "" {
+	if oidcRequest == nil {
+		return nil, fmt.Errorf("%s: request is nil: %w", op, ErrNilParameter)
+	}
+	requestNonce := oidcRequest.Nonce()
+	requestAudiences := oidcRequest.Audiences()
+	maxAgeSeconds, maxAgeAuthAfter := oidcRequest.MaxAge()
+	if requestNonce == "" {
 		return nil, fmt.Errorf("%s: nonce is empty: %w", op, ErrInvalidParameter)
+	}
+	// A nonce which has been used to verify an implicit-flow ID token may not
+	// be used again.  Requests which are only used with VerifyIDToken (and
+	// never started with AuthURL) retain their historical stateless behavior.
+	if consumer, ok := oidcRequest.(RequestNonceConsumer); ok {
+		if err := consumer.ConsumeNonce(); err != nil {
+			return nil, fmt.Errorf("%s: unable to consume request nonce: %w", op, err)
+		}
 	}
 	algs := []string{}
 	for _, a := range p.config.SupportedSigningAlgs {
@@ -534,7 +612,7 @@ func (p *Provider) VerifyIDToken(ctx context.Context, t IDToken, oidcRequest Req
 	}
 	// so.. we still need to check: nonce, iat, auth_time, azp, the aud includes
 	// additional audiences configured.
-	if oidcIDToken.Nonce != oidcRequest.Nonce() {
+	if oidcIDToken.Nonce != requestNonce {
 		return nil, fmt.Errorf("%s: invalid id_token nonce: %w", op, ErrInvalidNonce)
 	}
 	if nowTime.Add(leeway).Before(oidcIDToken.IssuedAt) {
@@ -557,8 +635,8 @@ func (p *Provider) VerifyIDToken(ctx context.Context, t IDToken, oidcRequest Req
 
 	var audiences []string
 	switch {
-	case len(oidcRequest.Audiences()) > 0:
-		audiences = oidcRequest.Audiences()
+	case len(requestAudiences) > 0:
+		audiences = requestAudiences
 	default:
 		audiences = p.config.Audiences
 	}
@@ -594,14 +672,14 @@ func (p *Provider) VerifyIDToken(ctx context.Context, t IDToken, oidcRequest Req
 			ErrInvalidAuthorizedParty)
 	}
 
-	if secs, authAfter := oidcRequest.MaxAge(); !authAfter.IsZero() {
+	if !maxAgeAuthAfter.IsZero() {
 		atClaim, ok := claims["auth_time"].(float64)
 		if !ok {
 			return nil, fmt.Errorf("%s: missing auth_time claim when max age was requested: %w", op, ErrMissingClaim)
 		}
 		authTime := time.Unix(int64(atClaim), 0)
-		if !authTime.Add(leeway).After(authAfter) {
-			return nil, fmt.Errorf("%s: auth_time (%s) is beyond max age (%d / %s): %w", op, authTime, secs, authAfter, ErrExpiredAuthTime)
+		if !authTime.Add(leeway).After(maxAgeAuthAfter) {
+			return nil, fmt.Errorf("%s: auth_time (%s) is beyond max age (%d / %s): %w", op, authTime, maxAgeSeconds, maxAgeAuthAfter, ErrExpiredAuthTime)
 		}
 	}
 

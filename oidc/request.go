@@ -5,6 +5,7 @@ package oidc
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"golang.org/x/text/language"
@@ -136,8 +137,83 @@ type Request interface {
 	ACRValues() []string
 }
 
+// RequestFreezer is an optional interface implemented by Request types that
+// can freeze the authentication parameters used to start a flow.  Provider
+// implementations call Freeze before an authorization URL is created so a
+// request cannot change its state, nonce, or PKCE verifier after the flow has
+// been initiated.
+type RequestFreezer interface {
+	Freeze() error
+}
+
+// RequestGeneration is an optional interface implemented by Request types
+// which track the number of authentication attempts started for the request.
+// A generation is advanced when Freeze is called.
+type RequestGeneration interface {
+	Generation() uint64
+}
+
+// RequestConsumer is an optional interface implemented by Request types that
+// can be consumed exactly once.
+type RequestConsumer interface {
+	Consume() error
+}
+
+// RequestExchangeConsumer is an optional interface implemented by Request
+// types that can consume the authorization-code side of a request exactly
+// once.
+type RequestExchangeConsumer interface {
+	ConsumeExchange() error
+}
+
+// RequestNonceConsumer is an optional interface implemented by Request types
+// that can consume a request's nonce exactly once.
+type RequestNonceConsumer interface {
+	ConsumeNonce() error
+}
+
+// RequestFlowConsumer is an optional interface implemented by Request types
+// that can consume the request's state, authorization-code exchange, and nonce
+// together.  Callback handlers use it when an authentication attempt fails so
+// none of the request's credentials can be used by a later callback.
+type RequestFlowConsumer interface {
+	ConsumeAll()
+}
+
+// requestLifecycle contains the mutable, shared state of a Request.  It is a
+// pointer so copies of Req (for example a request restored from a cache) share
+// the same one-time consumption state.
+type requestLifecycle struct {
+	mu sync.RWMutex
+
+	// frozen indicates that Freeze has captured the request's authentication
+	// parameters.  Once frozen, the getters continue to return the captured
+	// values even if the underlying fields are changed.
+	frozen         bool
+	frozenState    string
+	frozenNonce    string
+	frozenVerifier CodeVerifier
+
+	// generation is advanced each time the request is frozen for an
+	// authentication attempt.
+	generation uint64
+
+	// stateConsumed, exchangeConsumed, and nonceConsumed make the respective
+	// parts of the flow single-use.
+	stateConsumed    bool
+	exchangeConsumed bool
+	nonceConsumed    bool
+}
+
 // Req represents the oidc request used for oidc flows and implements the Request interface.
 type Req struct {
+	// lifecycleMu guards lazy initialization of lifecycle for Req values
+	// created without NewRequest.
+	lifecycleMu sync.Mutex
+
+	// lifecycle is shared by copies of Req.
+	lifecycle *requestLifecycle
+
 	//	state is a unique identifier and an opaque value used to maintain request
 	//	between the oidc request and the callback.
 	state string
@@ -213,7 +289,15 @@ type Req struct {
 }
 
 // ensure that Request implements the Request interface.
-var _ Request = (*Req)(nil)
+var (
+	_ Request                 = (*Req)(nil)
+	_ RequestFreezer          = (*Req)(nil)
+	_ RequestGeneration       = (*Req)(nil)
+	_ RequestConsumer         = (*Req)(nil)
+	_ RequestExchangeConsumer = (*Req)(nil)
+	_ RequestNonceConsumer    = (*Req)(nil)
+	_ RequestFlowConsumer     = (*Req)(nil)
+)
 
 // NewRequest creates a new Request (*Req).
 //
@@ -269,6 +353,7 @@ func NewRequest(expireIn time.Duration, redirectURL string, opt ...Option) (*Req
 		return nil, fmt.Errorf("%s: requested both implicit flow and authorization code with PKCE: %w", op, ErrInvalidParameter)
 	}
 	r := &Req{
+		lifecycle:     &requestLifecycle{},
 		state:         state,
 		nonce:         nonce,
 		redirectURL:   redirectURL,
@@ -293,10 +378,26 @@ func NewRequest(expireIn time.Duration, redirectURL string, opt ...Option) (*Req
 }
 
 // State implements the Request.State() interface function.
-func (r *Req) State() string { return r.state }
+func (r *Req) State() string {
+	lifecycle := r.lifecycleState()
+	lifecycle.mu.RLock()
+	defer lifecycle.mu.RUnlock()
+	if lifecycle.frozen {
+		return lifecycle.frozenState
+	}
+	return r.state
+}
 
 // Nonce implements the Request.Nonce() interface function.
-func (r *Req) Nonce() string { return r.nonce }
+func (r *Req) Nonce() string {
+	lifecycle := r.lifecycleState()
+	lifecycle.mu.RLock()
+	defer lifecycle.mu.RUnlock()
+	if lifecycle.frozen {
+		return lifecycle.frozenNonce
+	}
+	return r.nonce
+}
 
 // Audiences implements the Request.Audiences() interface function and returns a
 // copy of the audiences.
@@ -326,10 +427,145 @@ func (r *Req) RedirectURL() string { return r.redirectURL }
 // PKCEVerifier implements the Request.PKCEVerifier() interface function and
 // returns a copy of the CodeVerifier
 func (r *Req) PKCEVerifier() CodeVerifier {
+	lifecycle := r.lifecycleState()
+	lifecycle.mu.RLock()
+	defer lifecycle.mu.RUnlock()
+	if lifecycle.frozen {
+		if lifecycle.frozenVerifier == nil {
+			return nil
+		}
+		return lifecycle.frozenVerifier.Copy()
+	}
 	if r.withVerifier == nil {
 		return nil
 	}
 	return r.withVerifier.Copy()
+}
+
+// Freeze captures the request's state, nonce, and PKCE verifier and advances
+// the request generation.  It must be called before starting an
+// authentication flow (Provider.AuthURL does this automatically).  Once
+// frozen, the captured values are returned by State, Nonce, and PKCEVerifier
+// even if the request is subsequently modified.
+//
+// Freeze returns ErrRequestConsumed if the request has already been consumed.
+func (r *Req) Freeze() error {
+	lifecycle := r.lifecycleState()
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if lifecycle.stateConsumed || lifecycle.exchangeConsumed || lifecycle.nonceConsumed {
+		return ErrRequestConsumed
+	}
+	if !lifecycle.frozen {
+		lifecycle.frozenState = r.state
+		lifecycle.frozenNonce = r.nonce
+		if r.withVerifier != nil {
+			lifecycle.frozenVerifier = r.withVerifier.Copy()
+		}
+		lifecycle.frozen = true
+	}
+	lifecycle.generation++
+	return nil
+}
+
+// Frozen returns true after the request has been frozen by Freeze.
+func (r *Req) Frozen() bool {
+	lifecycle := r.lifecycleState()
+	lifecycle.mu.RLock()
+	defer lifecycle.mu.RUnlock()
+	return lifecycle.frozen
+}
+
+// Generation returns the number of times the request has been frozen for an
+// authentication attempt.
+func (r *Req) Generation() uint64 {
+	lifecycle := r.lifecycleState()
+	lifecycle.mu.RLock()
+	defer lifecycle.mu.RUnlock()
+	return lifecycle.generation
+}
+
+// Consume marks the request's authentication state as consumed.  It returns
+// ErrRequestConsumed when called more than once.
+func (r *Req) Consume() error {
+	lifecycle := r.lifecycleState()
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if lifecycle.stateConsumed {
+		return ErrRequestConsumed
+	}
+	lifecycle.stateConsumed = true
+	return nil
+}
+
+// IsConsumed reports whether the request's authentication state has been
+// consumed.
+func (r *Req) IsConsumed() bool {
+	lifecycle := r.lifecycleState()
+	lifecycle.mu.RLock()
+	defer lifecycle.mu.RUnlock()
+	return lifecycle.stateConsumed
+}
+
+// ConsumeExchange marks the authorization-code exchange as consumed for a
+// request which has started a flow with Freeze or whose state has already been
+// consumed by a callback.  It returns ErrRequestConsumed when called more than
+// once.  Requests which are used directly with Provider.Exchange without an
+// authentication initiation are left untouched, preserving stateless use.
+func (r *Req) ConsumeExchange() error {
+	lifecycle := r.lifecycleState()
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if !lifecycle.frozen && !lifecycle.stateConsumed {
+		return nil
+	}
+	if lifecycle.exchangeConsumed {
+		return ErrRequestConsumed
+	}
+	lifecycle.exchangeConsumed = true
+	return nil
+}
+
+// ConsumeNonce marks the request's nonce as consumed for a request which has
+// started a flow with Freeze or whose state has already been consumed by a
+// callback.  It returns ErrRequestConsumed when called more than once.
+// Requests which are used directly with Provider.VerifyIDToken without an
+// authentication initiation are left untouched, preserving stateless use.
+func (r *Req) ConsumeNonce() error {
+	lifecycle := r.lifecycleState()
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if !lifecycle.frozen && !lifecycle.stateConsumed {
+		return nil
+	}
+	if lifecycle.nonceConsumed {
+		return ErrRequestConsumed
+	}
+	lifecycle.nonceConsumed = true
+	return nil
+}
+
+// ConsumeAll marks the request's state, authorization-code exchange, and nonce
+// as consumed.  It is used after a callback fails and is safe to call more than
+// once.
+func (r *Req) ConsumeAll() {
+	lifecycle := r.lifecycleState()
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	lifecycle.stateConsumed = true
+	lifecycle.exchangeConsumed = true
+	lifecycle.nonceConsumed = true
+}
+
+// lifecycleState returns the shared lifecycle state, creating it for Req
+// values which were not created by NewRequest.
+func (r *Req) lifecycleState() *requestLifecycle {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.lifecycle == nil {
+		r.lifecycle = &requestLifecycle{}
+	}
+	return r.lifecycle
 }
 
 // ClientAssertionJWT implements the Request.ClientAssertionJWT() interface

@@ -41,3 +41,15 @@ var (
 	ErrExpiredAuthTime            = errors.New("expired auth_time")
 	ErrMissingClaim               = errors.New("missing required claim")
 )
+
+type requestConsumedError struct{}
+
+func (requestConsumedError) Error() string { return "request already consumed: not found" }
+
+func (requestConsumedError) Unwrap() error { return ErrNotFound }
+
+// ErrRequestConsumed indicates that a request's state, PKCE verifier, nonce,
+// or authorization-code exchange has already been used.  It also matches
+// ErrNotFound so callbacks can keep returning their existing not-found
+// response for a replayed state.
+var ErrRequestConsumed error = requestConsumedError{}

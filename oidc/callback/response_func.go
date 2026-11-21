@@ -18,9 +18,9 @@ import (
 // should use the http.ResponseWriter to send back whatever content (headers,
 // html, JSON, etc) it wishes to the client that originated the oidc flow.
 //
-// Just a reminder that the function parameters could also be used to
-// update the oidc.Request for the request or log info about the request, if the
-// implementation requires it.
+// The oidc.Request associated with state has already been consumed when this
+// function is called, so it must not be used to start or complete another
+// authentication flow.
 type SuccessResponseFunc func(state string, t oidc.Token, w http.ResponseWriter, req *http.Request)
 
 // ErrorResponseFunc is used by Callbacks to create a http response when the
@@ -32,9 +32,10 @@ type SuccessResponseFunc func(state string, t oidc.Token, w http.ResponseWriter,
 // should use the http.ResponseWriter to send back whatever content (headers,
 // html, JSON, etc) it wishes to the client that originated the oidc flow.
 //
-// Just a reminder that the function parameters could also be used to
-// update the oidc.Request for the request or log info about the request, if the
-// implementation requires it.
+// The oidc.Request associated with state has already been consumed when this
+// function is called, even when the error was returned by the provider rather
+// than by the token exchange.  The request must not be used to start or
+// complete another authentication flow.
 type ErrorResponseFunc func(state string, respErr *AuthenErrorResponse, e error, w http.ResponseWriter, req *http.Request)
 
 // AuthenErrorResponse represents Oauth2 error responses.  See:

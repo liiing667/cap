@@ -37,20 +37,35 @@ func Implicit(ctx context.Context, p *oidc.Provider, rw RequestReader, sFn Succe
 	if eFn == nil {
 		return nil, fmt.Errorf("%s: error response func is empty: %w", op, oidc.ErrInvalidParameter)
 	}
+	reader := newConsumingReader(rw)
 	return func(w http.ResponseWriter, req *http.Request) {
 		const op = "callback.Implicit"
 
 		reqState := req.FormValue("state")
 
-		if err := req.FormValue("error"); err != "" {
+		if reqError := req.FormValue("error"); reqError != "" {
+			// Consume the pending request even though authentication failed.
+			// This prevents the state, nonce, and any PKCE verifier from being
+			// replayed by a later callback.
+			if reqState != "" {
+				oidcRequest, err := reader.consume(ctx, reqState)
+				switch {
+				case err == nil && oidcRequest != nil:
+					consumeFailedFlow(oidcRequest)
+				case requestAlreadyConsumed(err):
+					responseErr := fmt.Errorf("%s: auth code request not found: %w", op, oidc.ErrNotFound)
+					eFn(reqState, nil, responseErr, w, req)
+					return
+				}
+			}
 			// get parameters from either the body or query parameters.
 			// FormValue prioritizes body values, if found
-			reqError := &AuthenErrorResponse{
-				Error:       err,
+			response := &AuthenErrorResponse{
+				Error:       reqError,
 				Description: req.FormValue("error_description"),
 				Uri:         req.FormValue("error_uri"),
 			}
-			eFn(reqState, reqError, nil, w, req)
+			eFn(reqState, response, nil, w, req)
 			return
 		}
 		if reqState == "" {
@@ -59,8 +74,13 @@ func Implicit(ctx context.Context, p *oidc.Provider, rw RequestReader, sFn Succe
 			return
 		}
 
-		oidcRequest, err := rw.Read(ctx, reqState)
+		oidcRequest, err := reader.consume(ctx, reqState)
 		if err != nil {
+			if requestAlreadyConsumed(err) {
+				responseErr := fmt.Errorf("%s: auth code request not found: %w", op, oidc.ErrNotFound)
+				eFn(reqState, nil, responseErr, w, req)
+				return
+			}
 			responseErr := fmt.Errorf("%s: unable to read auth code request: %w", op, err)
 			eFn(reqState, nil, responseErr, w, req)
 			return
@@ -72,30 +92,35 @@ func Implicit(ctx context.Context, p *oidc.Provider, rw RequestReader, sFn Succe
 			eFn(reqState, nil, responseErr, w, req)
 			return
 		}
+		requestState := oidcRequest.State()
 		useImplicit, includeAccessToken := oidcRequest.ImplicitFlow()
 		if !useImplicit {
-			responseErr := fmt.Errorf("%s: request (%s) should not be using the implicit flow: %w", op, oidcRequest.State(), oidc.ErrInvalidFlow)
+			consumeFailedFlow(oidcRequest)
+			responseErr := fmt.Errorf("%s: request (%s) should not be using the implicit flow: %w", op, requestState, oidc.ErrInvalidFlow)
 			eFn(reqState, nil, responseErr, w, req)
 			return
 		}
 
 		if oidcRequest.IsExpired() {
+			consumeFailedFlow(oidcRequest)
 			responseErr := fmt.Errorf("%s: authentication request is expired: %w", op, oidc.ErrExpiredRequest)
 			eFn(reqState, nil, responseErr, w, req)
 			return
 		}
 
-		if reqState != oidcRequest.State() {
+		if reqState != requestState {
+			consumeFailedFlow(oidcRequest)
 			// the stateReadWriter didn't return the correct state for the key
 			// given... this is an internal sort of error on the part of the
 			// reader.
-			responseErr := fmt.Errorf("%s: authen state (%s) and response state (%s) are not equal: %w", op, oidcRequest.State(), reqState, oidc.ErrInvalidResponseState)
+			responseErr := fmt.Errorf("%s: authen state (%s) and response state (%s) are not equal: %w", op, requestState, reqState, oidc.ErrInvalidResponseState)
 			eFn(reqState, nil, responseErr, w, req)
 			return
 		}
 
 		reqIDToken := oidc.IDToken(req.FormValue("id_token"))
 		if _, err := p.VerifyIDToken(ctx, reqIDToken, oidcRequest); err != nil {
+			consumeFailedFlow(oidcRequest)
 			responseErr := fmt.Errorf("%s: unable to verify id_token: %w", op, err)
 			eFn(reqState, nil, responseErr, w, req)
 			return
@@ -106,6 +131,7 @@ func Implicit(ctx context.Context, p *oidc.Provider, rw RequestReader, sFn Succe
 			reqAccessToken := req.FormValue("access_token")
 			if reqAccessToken != "" {
 				if _, err := reqIDToken.VerifyAccessToken(oidc.AccessToken(reqAccessToken)); err != nil {
+					consumeFailedFlow(oidcRequest)
 					responseErr := fmt.Errorf("%s: unable to verify access_token: %w", op, err)
 					eFn(reqState, nil, responseErr, w, req)
 					return
@@ -118,6 +144,7 @@ func Implicit(ctx context.Context, p *oidc.Provider, rw RequestReader, sFn Succe
 
 		responseToken, err := oidc.NewToken(oidc.IDToken(reqIDToken), oath2Token)
 		if err != nil {
+			consumeFailedFlow(oidcRequest)
 			responseErr := fmt.Errorf("%s: unable to create response tokens: %w", op, err)
 			eFn(reqState, nil, responseErr, w, req)
 			return

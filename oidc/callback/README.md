@@ -5,6 +5,18 @@ The callback package includes handlers (http.HandlerFunc) which can be used
 for the callback leg an OIDC flow. Callback handlers for both the authorization
 code flow (with optional PKCE) and the implicit flow are provided.
 
+Callback handlers consume the pending `oidc.Request` exactly once, including
+when the provider returns an authentication error or the token exchange fails.
+`SingleRequestReader` records consumption on the request itself, so rebuilding
+a handler (for example during a process restart) cannot make a state, nonce, or
+PKCE verifier reusable.
+
+Applications which store requests remotely should implement
+`callback.RequestConsumer`.  `Consume` must atomically remove (or durably mark
+as consumed) the state before returning so concurrent callbacks and process
+restarts cannot reuse it.  Implementations which only provide `Read` remain
+single-use for the lifetime of a callback handler.
+
 <hr>
 
 ### Example snippets...
