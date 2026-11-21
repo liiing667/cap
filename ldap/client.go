@@ -44,7 +44,11 @@ type ldapConnector interface {
 // Client provides a client for making requests to a directory service.
 type Client struct {
 	conf *ClientConfig
-	// make this an inteface so we can mock it out in tests
+	// conn is only used by callers that manage a connection directly (and by
+	// tests). Authenticate retires it and uses a connection scoped to the
+	// authentication attempt so bind state and search results cannot leak
+	// between users.
+	// make this an interface so we can mock it out in tests
 	conn ldapConnector
 }
 
@@ -98,23 +102,43 @@ func NewClient(ctx context.Context, conf *ClientConfig) (*Client, error) {
 	}, nil
 }
 
-// connect will connect to a directory server using the URLs from the config or
-// the WithURLs option.  It will attempt   Supports options: WithDialer, WithURLs
+// connect creates a new connection to a directory server using the URLs from
+// the config or the WithURLs option. The connection is stored on the client
+// only for callers that deliberately manage the client's connection directly
+// (for example, tests and legacy callers). A failed reconnect must not leave
+// the client holding a connection from a previous bind.
+//
+// Supports options: WithDialer, WithURLs
 func (c *Client) connect(ctx context.Context, opt ...Option) error {
+	// Retire the previous connection before reconnecting. A timeout or a
+	// server restart can leave the old connection in place, but it must never
+	// be reused for a later bind.
+	c.closeConn()
+	conn, err := c.dial(ctx, opt...)
+	if err != nil {
+		return err
+	}
+	c.conn = conn
+	return nil
+}
+
+// dial creates a new connection without changing any connection owned by the
+// client.
+func (c *Client) dial(ctx context.Context, opt ...Option) (ldapConnector, error) {
 	const op = "ldap.(Client).connect"
 	if c.conf == nil {
-		return fmt.Errorf("%s: missing configuration: %w", op, ErrInternal)
+		return nil, fmt.Errorf("%s: missing configuration: %w", op, ErrInternal)
 	}
 	opts := getConfigOpts(opt...)
 	if len(c.conf.URLs) == 0 && len(opts.withURLs) == 0 {
-		return fmt.Errorf("%s: missing both configuration and optional LDAP URLs: %w", op, ErrInvalidParameter)
+		return nil, fmt.Errorf("%s: missing both configuration and optional LDAP URLs: %w", op, ErrInvalidParameter)
 	}
 	if len(opts.withURLs) == 0 {
 		opts.withURLs = c.conf.URLs
 	}
 	var retErr *multierror.Error
-	var conn *ldap.Conn
 	for _, uut := range opts.withURLs {
+		var conn *ldap.Conn
 		u, err := url.Parse(uut)
 		if err != nil {
 			retErr = multierror.Append(retErr, fmt.Errorf("%s: error parsing url %q: %w", op, uut, err))
@@ -169,17 +193,32 @@ func (c *Client) connect(ctx context.Context, opt ...Option) error {
 			continue
 		}
 		if err == nil {
-			retErr = nil
-			break
+			if conn == nil {
+				retErr = multierror.Append(retErr, fmt.Errorf("%s: empty connection after dialing: %w", op, ErrUnknown))
+				continue
+			}
+			conn.SetTimeout(c.getTimeout())
+			return conn, nil
+		}
+		if conn != nil {
+			_ = conn.Close()
 		}
 		retErr = multierror.Append(retErr, fmt.Errorf("%s: error connecting to host %q: %w", op, uut, err))
 	}
-	if retErr != nil {
-		return retErr
+	return nil, retErr
+}
+
+// closeConn closes and clears the client's stored connection.
+func (c *Client) closeConn() {
+	if c == nil {
+		return
 	}
-	conn.SetTimeout(c.getTimeout())
-	c.conn = conn
-	return nil
+	conn := c.conn
+	if conn == nil {
+		return
+	}
+	c.conn = nil
+	_ = conn.Close()
 }
 
 func (c *Client) getTimeout() time.Duration {
@@ -238,27 +277,34 @@ func (c *Client) Authenticate(ctx context.Context, username, password string, op
 		return nil, fmt.Errorf("%s: password cannot be of zero length if allow_empty_passwd_bind is not enabled: %w", op, ErrInvalidParameter)
 	}
 
-	if err := c.connect(ctx, opt...); err != nil {
+	// Each authentication attempt gets its own connection. A Client can be
+	// reused across users and retried after a timeout; sharing the connection
+	// would also share its bind identity and could return the previous user's
+	// group search results.
+	c.closeConn()
+	authClient := &Client{conf: c.conf}
+	if err := authClient.connect(ctx, opt...); err != nil {
 		return nil, fmt.Errorf("%s: failed to connect: %w", op, err)
 	}
+	defer authClient.Close(ctx)
 
-	userBindDN, err := c.getUserBindDN(username)
+	userBindDN, err := authClient.getUserBindDN(username)
 	if err != nil {
 		return nil, fmt.Errorf("%s: discovery of user bind DN failed: %w", op, err)
 	}
 
 	// Try to bind as the login user. This is where the actual authentication takes place.
 	if len(password) > 0 {
-		err = c.conn.Bind(userBindDN, password)
+		err = authClient.conn.Bind(userBindDN, password)
 	} else {
-		err = c.conn.UnauthenticatedBind(userBindDN)
+		err = authClient.conn.UnauthenticatedBind(userBindDN)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("%s: unable to bind user: %w", op, err)
 	}
 	opts := getConfigOpts(opt...)
-	if !opts.withGroups && !c.conf.IncludeUserGroups &&
-		!opts.withUserAttributes && !c.conf.IncludeUserAttributes {
+	if !opts.withGroups && !authClient.conf.IncludeUserGroups &&
+		!opts.withUserAttributes && !authClient.conf.IncludeUserAttributes {
 		return &AuthResult{
 			Success: true,
 		}, nil
@@ -266,34 +312,34 @@ func (c *Client) Authenticate(ctx context.Context, username, password string, op
 
 	// We re-bind to the BindDN if it's defined because we assume the BindDN
 	// should be the one to search, not the user authenticating.
-	if c.conf.BindDN != "" && c.conf.BindPassword != "" {
-		if err := c.conn.Bind(c.conf.BindDN, c.conf.BindPassword); err != nil {
+	if authClient.conf.BindDN != "" && authClient.conf.BindPassword != "" {
+		if err := authClient.conn.Bind(authClient.conf.BindDN, authClient.conf.BindPassword); err != nil {
 			// unless the binddn was changed during this inflight authentication
 			// flow, it should be very difficult to encounter this error
 			return nil, fmt.Errorf("%s: unable to re-bind with the configuration BindDN user: %w", op, err)
 		}
 	}
 
-	userDN, err := c.getUserDN(userBindDN, username)
+	userDN, err := authClient.getUserDN(userBindDN, username)
 	if err != nil {
 		return nil, fmt.Errorf("%s: failed to get the DN for the authenticated user: %w", op, err)
 	}
 
 	userAttrs := map[string][]string{}
-	if c.conf.IncludeUserAttributes || opts.withUserAttributes {
-		attrs, err := c.getUserAttributes(userDN)
+	if authClient.conf.IncludeUserAttributes || opts.withUserAttributes {
+		attrs, err := authClient.getUserAttributes(userDN)
 		if err != nil {
 			return nil, fmt.Errorf("%s: failed to get user attributes: %w", op, err)
 		}
 		for _, a := range attrs {
 			name := a.Name
-			if c.conf.LowerUserAttributeKeys || opts.withLowerUserAttributeKeys {
+			if authClient.conf.LowerUserAttributeKeys || opts.withLowerUserAttributeKeys {
 				name = strings.ToLower(a.Name)
 			}
 			userAttrs[name] = a.Vals
 		}
 	}
-	if !opts.withGroups && !c.conf.IncludeUserGroups {
+	if !opts.withGroups && !authClient.conf.IncludeUserGroups {
 		return &AuthResult{
 			Success:        true,
 			UserDN:         userDN,
@@ -301,26 +347,26 @@ func (c *Client) Authenticate(ctx context.Context, username, password string, op
 		}, nil
 	}
 
-	if c.conf.AnonymousGroupSearch {
+	if authClient.conf.AnonymousGroupSearch {
 		// Some LDAP servers will reject anonymous group searches if userDN is
 		// included in the query.
 		dn := userDN
-		if c.conf.AllowEmptyAnonymousGroupSearch || opts.withEmptyAnonymousGroupSearch {
+		if authClient.conf.AllowEmptyAnonymousGroupSearch || opts.withEmptyAnonymousGroupSearch {
 			dn = ""
 		}
 
-		if err := c.conn.UnauthenticatedBind(dn); err != nil {
+		if err := authClient.conn.UnauthenticatedBind(dn); err != nil {
 			return nil, fmt.Errorf("%s: group search anonymous bind failed: %w", op, err)
 		}
 	}
 
-	ldapGroups, warnings, err := c.getGroups(userDN, username)
+	ldapGroups, warnings, err := authClient.getGroups(userDN, username)
 	if err != nil {
 		return nil, fmt.Errorf("%s: unable to get user groups: %w", op, err)
 	}
 
 	switch {
-	case c.conf.IncludeUserAttributes || opts.withUserAttributes:
+	case authClient.conf.IncludeUserAttributes || opts.withUserAttributes:
 		return &AuthResult{
 			Success:        true,
 			UserDN:         userDN,
@@ -339,9 +385,7 @@ func (c *Client) Authenticate(ctx context.Context, username, password string, op
 
 // Close will close the client's connection to the directory service.
 func (c *Client) Close(ctx context.Context) {
-	if c.conn != nil {
-		c.conn.Close()
-	}
+	c.closeConn()
 }
 
 func (c *Client) getUserAttributes(userDN string) ([]Attribute, error) {
