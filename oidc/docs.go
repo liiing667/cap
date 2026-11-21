@@ -25,6 +25,10 @@ signing algorithms, additional scopes requested, etc)
 capabilities like: generating an auth URL, exchanging codes for tokens,
 verifying tokens, making user info requests, etc.
 
+* RefreshRotator and RefreshStore: provide generation-fenced refresh-token
+rotation with durable replay history, concurrent-request fencing, and
+uncertain-outcome handling across process restarts.
+
 # The oidc.callback package
 
 The callback package includes handlers (http.HandlerFunc) which can be used

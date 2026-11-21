@@ -54,6 +54,11 @@ type Tk struct {
 	// nowFunc is an optional function that returns the current time
 	nowFunc func() time.Time
 
+	// generation identifies the committed refresh-token generation which
+	// produced this token. Tokens returned by an authorization-code exchange
+	// start at generation zero.
+	generation uint64
+
 	// additionalClaims holds resolved claims that are populated post OIDC exchange for
 	// provider specific resolution that cannot be written back into the signed id_token.
 	additionalClaims map[string]any
@@ -63,8 +68,8 @@ type Tk struct {
 var _ Token = (*Tk)(nil)
 
 // NewToken creates a new Token (*Tk).  The IDToken is required and the
-// *oauth2.Token may be nil.  Supports the WithNow option (with a default to
-// time.Now).
+// *oauth2.Token may be nil.  Supports the WithNow and WithTokenGeneration
+// options (WithNow defaults to time.Now and generation defaults to zero).
 func NewToken(i IDToken, t *oauth2.Token, opt ...Option) (*Tk, error) {
 	// since oauth2 is part of stdlib we're not going to worry about it leaking
 	// into our abstraction in this factory
@@ -77,6 +82,7 @@ func NewToken(i IDToken, t *oauth2.Token, opt ...Option) (*Tk, error) {
 		idToken:          i,
 		underlying:       t,
 		nowFunc:          opts.withNowFunc,
+		generation:       opts.withGeneration,
 		additionalClaims: make(map[string]any),
 	}, nil
 }
@@ -101,6 +107,17 @@ func (t *Tk) RefreshToken() RefreshToken {
 
 // IDToken implements the IDToken.IDToken() interface function.
 func (t *Tk) IDToken() IDToken { return IDToken(t.idToken) }
+
+// Generation returns the committed refresh-token generation which produced the
+// token. A token returned directly from an authorization-code exchange has
+// generation zero. Refreshed tokens returned by Provider.RotateToken carry the
+// generation committed by the refresh store.
+func (t *Tk) Generation() uint64 {
+	if t == nil {
+		return 0
+	}
+	return t.generation
+}
 
 // TokenExpirySkew defines a time skew when checking a Token's expiration.
 const TokenExpirySkew = 10 * time.Second
@@ -185,7 +202,8 @@ func (t *Tk) EffectiveClaims(v any) error {
 
 // tokenOptions is the set of available options for Token functions
 type tokenOptions struct {
-	withNowFunc func() time.Time
+	withNowFunc    func() time.Time
+	withGeneration uint64
 }
 
 // tokenDefaults is a handy way to get the defaults at runtime and during unit
@@ -200,6 +218,18 @@ func getTokenOpts(opt ...Option) tokenOptions {
 	opts := tokenDefaults()
 	ApplyOpts(&opts, opt...)
 	return opts
+}
+
+// WithTokenGeneration sets the refresh-token generation recorded on a Tk.
+//
+// Valid for: Tk
+func WithTokenGeneration(generation uint64) Option {
+	return func(o interface{}) {
+		switch v := o.(type) {
+		case *tokenOptions:
+			v.withGeneration = generation
+		}
+	}
 }
 
 // UnmarshalClaims will retrieve the claims from the provided raw JWT token.

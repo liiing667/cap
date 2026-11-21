@@ -22,6 +22,13 @@ Primary types provided by the package:
   The provider provides capabilities like: generating an auth URL, exchanging
   codes for tokens, verifying tokens, making user info requests, etc.
 
+* `RefreshRotator` and `RefreshStore`: provide generation-fenced refresh-token
+  rotation. A rotation is reserved in the store before the token endpoint is
+  called and is committed only after the store confirms the new generation.
+  Concurrent requests and processes cannot commit two generations, and a
+  timeout or expired lease becomes an uncertain session rather than an
+  invitation to retry the old refresh token.
+
 * `Alg`: represents asymmetric signing algorithms
 
 * `Error`: provides an error and provides the ability to specify an error code,
@@ -33,6 +40,35 @@ Primary types provided by the package:
 The callback package includes handlers (http.HandlerFunc) which can be used
 for the callback leg an OIDC flow. Callback handlers for both the authorization
 code flow (with optional PKCE) and the implicit flow are provided.
+
+<hr>
+
+### Refresh-token rotation
+
+An application which accepts refresh tokens should retain the returned
+`RefreshSession` in a durable `RefreshStore`, and use `Provider.RotateToken`
+with a `RefreshRotator`:
+
+```go
+store := oidc.NewMemoryRefreshStore() // replace with a durable store
+rotator, err := oidc.NewRefreshRotator(store, provider)
+if err != nil {
+  // handle error
+}
+if _, err := rotator.Create(ctx, "browser-session", token.RefreshToken()); err != nil {
+  // handle error
+}
+
+next, err := provider.RotateToken(ctx, token, rotator, "browser-session")
+if err != nil {
+  // On ErrRefreshUncertain, do not retry the previous refresh token.
+  // Reconcile the session from durable state or require re-authentication.
+}
+```
+
+`NewRefreshSession` caps the idle deadline at an immutable absolute deadline,
+so repeated rotations cannot extend a stolen refresh token indefinitely.
+Spent token digests remain in the session and are rejected after a restart.
 
 <hr>
 
