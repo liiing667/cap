@@ -237,6 +237,13 @@ type ClientConfig struct {
 
 func (c *ClientConfig) clone() (*ClientConfig, error) {
 	clone := *c
+	clone.URLs = append([]string(nil), c.URLs...)
+	clone.Certificates = append([]string(nil), c.Certificates...)
+	clone.ExcludedUserAttributes = append([]string(nil), c.ExcludedUserAttributes...)
+	if c.DeprecatedVaultPre111GroupCNBehavior != nil {
+		v := *c.DeprecatedVaultPre111GroupCNBehavior
+		clone.DeprecatedVaultPre111GroupCNBehavior = &v
+	}
 	return &clone, nil
 }
 

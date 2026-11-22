@@ -10,12 +10,15 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"text/template"
 	"time"
 
@@ -46,6 +49,224 @@ type Client struct {
 	conf *ClientConfig
 	// make this an inteface so we can mock it out in tests
 	conn ldapConnector
+	// dialFunc is an optional test seam for exercising URL recovery without a
+	// network listener. Production clients use dialOne.
+	dialFunc func(context.Context, string) (*ldapConnection, error)
+}
+
+// ldapConnection identifies the directory server that owns conn. URL, host,
+// TLS configuration, and conn are always created together so a connection can
+// never inherit the identity of a different URL.
+type ldapConnection struct {
+	conn ldapConnector
+	url  string
+	host string
+}
+
+// boundIdentity is the identity currently bound on a connection.
+type boundIdentity struct {
+	dn          string
+	anonymous   bool
+	hasIdentity bool
+}
+
+// trackedConn owns all bind and search activity for one authentication
+// generation. In particular, it records the identity used for the most recent
+// successful bind and makes searches context-aware. A connection is never
+// shared between generations.
+type trackedConn struct {
+	ldapConnector
+	ctx context.Context
+
+	closeOnce sync.Once
+	closeErr  error
+
+	mu       sync.RWMutex
+	lastBind boundIdentity
+}
+
+func newTrackedConn(ctx context.Context, conn ldapConnector) *trackedConn {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &trackedConn{
+		ldapConnector: conn,
+		ctx:           ctx,
+	}
+}
+
+func (c *trackedConn) recordBind(dn string, anonymous bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastBind = boundIdentity{
+		dn:          dn,
+		anonymous:   anonymous,
+		hasIdentity: true,
+	}
+}
+
+func (c *trackedConn) lastBinding() boundIdentity {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastBind
+}
+
+func (c *trackedConn) contextDone() <-chan struct{} {
+	if c == nil || c.ctx == nil {
+		return nil
+	}
+	return c.ctx.Done()
+}
+
+func (c *trackedConn) Bind(username, password string) error {
+	err := runWithContext(c.ctx, c.Close, func() error {
+		return c.ldapConnector.Bind(username, password)
+	})
+	if err == nil {
+		c.recordBind(username, false)
+	}
+	return err
+}
+
+func (c *trackedConn) UnauthenticatedBind(username string) error {
+	err := runWithContext(c.ctx, c.Close, func() error {
+		return c.ldapConnector.UnauthenticatedBind(username)
+	})
+	if err == nil {
+		c.recordBind(username, true)
+	}
+	return err
+}
+
+func (c *trackedConn) Search(req *ldap.SearchRequest) (*ldap.SearchResult, error) {
+	if c.contextDone() == nil {
+		return c.ldapConnector.Search(req)
+	}
+	return runSearchWithContext(c.ctx, c.Close, func() (*ldap.SearchResult, error) {
+		return c.ldapConnector.Search(req)
+	})
+}
+
+func (c *trackedConn) SearchWithPaging(req *ldap.SearchRequest, pagingSize uint32) (*ldap.SearchResult, error) {
+	if c.contextDone() == nil {
+		return c.ldapConnector.SearchWithPaging(req, pagingSize)
+	}
+	return runSearchWithContext(c.ctx, c.Close, func() (*ldap.SearchResult, error) {
+		return c.ldapConnector.SearchWithPaging(req, pagingSize)
+	})
+}
+
+func (c *trackedConn) Close() error {
+	c.closeOnce.Do(func() {
+		if c.ldapConnector != nil {
+			c.closeErr = c.ldapConnector.Close()
+		}
+	})
+	return c.closeErr
+}
+
+// authAttempt is one recoverable authentication generation. URL selection,
+// TLS, bind identity, group collection, and the final AuthResult all belong to
+// this value. Retrying creates a new authAttempt, which starts with empty group
+// and identity state.
+type authAttempt struct {
+	id        uint64
+	url       string
+	host      string
+	conf      *ClientConfig
+	dialFunc  func(context.Context, string) (*ldapConnection, error)
+	conn      *trackedConn
+	client    *Client
+	connected bool
+
+	userBindDN  string
+	groupBindDN string
+}
+
+var authAttemptSequence atomic.Uint64
+
+func newAuthAttempt(conf *ClientConfig, rawURL string, dialFunc func(context.Context, string) (*ldapConnection, error)) *authAttempt {
+	host := rawURL
+	if u, err := url.Parse(rawURL); err == nil && u.Host != "" {
+		host = u.Host
+	}
+	return &authAttempt{
+		id:       authAttemptSequence.Add(1),
+		url:      rawURL,
+		host:     host,
+		conf:     conf,
+		dialFunc: dialFunc,
+	}
+}
+
+func (a *authAttempt) connect(ctx context.Context) error {
+	if a == nil || a.conf == nil {
+		return fmt.Errorf("ldap.(authAttempt).connect: missing configuration: %w", ErrInternal)
+	}
+	var conn *ldapConnection
+	var err error
+	if a.dialFunc != nil {
+		conn, err = a.dialFunc(ctx, a.url)
+	} else {
+		conn, err = (&Client{conf: a.conf}).dialOne(ctx, a.url)
+	}
+	if err != nil {
+		return err
+	}
+	if conn == nil || conn.conn == nil {
+		return fmt.Errorf("ldap.(authAttempt).connect: empty connection after dialing: %w", ErrUnknown)
+	}
+	if conn.url != "" {
+		a.url = conn.url
+	}
+	if conn.host != "" {
+		a.host = conn.host
+	}
+	a.conn = newTrackedConn(ctx, conn.conn)
+	a.client = &Client{
+		conf: a.conf,
+		conn: a.conn,
+	}
+	a.connected = true
+	return nil
+}
+
+func (a *authAttempt) close() error {
+	if a == nil || a.conn == nil {
+		return nil
+	}
+	if a.conn.ctx != nil && a.conn.ctx.Err() != nil {
+		// Cancellation must return promptly even if the directory server does
+		// not acknowledge the LDAP unbind promptly.
+		go func() { _ = a.conn.Close() }()
+		return nil
+	}
+	return a.conn.Close()
+}
+
+func (a *authAttempt) result(userDN string, userAttrs map[string][]string, groups []string, warnings []Warning) *AuthResult {
+	var groupCopy []string
+	if groups != nil {
+		groupCopy = make([]string, len(groups))
+		copy(groupCopy, groups)
+	}
+	var warningCopy []Warning
+	if warnings != nil {
+		warningCopy = make([]Warning, len(warnings))
+		copy(warningCopy, warnings)
+	}
+	return &AuthResult{
+		Success:        true,
+		Groups:         groupCopy,
+		UserDN:         userDN,
+		UserAttributes: userAttrs,
+		Warnings:       warningCopy,
+		Host:           a.host,
+		URL:            a.url,
+		BindDN:         a.userBindDN,
+		GroupBindDN:    a.groupBindDN,
+		Generation:     a.id,
+	}
 }
 
 // Warning is a warning message
@@ -99,58 +320,99 @@ func NewClient(ctx context.Context, conf *ClientConfig) (*Client, error) {
 }
 
 // connect will connect to a directory server using the URLs from the config or
-// the WithURLs option.  It will attempt   Supports options: WithDialer, WithURLs
+// the WithURLs option. A connection is always retired before a replacement is
+// selected, so a failed reconnect can never leave the previous bind identity
+// available to the next caller.
+//
+// Supports options: WithURLs
 func (c *Client) connect(ctx context.Context, opt ...Option) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.closeConn()
+	conn, err := c.dial(ctx, opt...)
+	if err != nil {
+		return err
+	}
+	c.conn = conn.conn
+	return nil
+}
+
+// dial selects one URL and creates its connection without changing the
+// connection currently owned by the Client. The URL, host, TLS configuration
+// and connection are returned as one value.
+func (c *Client) dial(ctx context.Context, opt ...Option) (*ldapConnection, error) {
 	const op = "ldap.(Client).connect"
-	if c.conf == nil {
-		return fmt.Errorf("%s: missing configuration: %w", op, ErrInternal)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c == nil || c.conf == nil {
+		return nil, fmt.Errorf("%s: missing configuration: %w", op, ErrInternal)
 	}
 	opts := getConfigOpts(opt...)
 	if len(c.conf.URLs) == 0 && len(opts.withURLs) == 0 {
-		return fmt.Errorf("%s: missing both configuration and optional LDAP URLs: %w", op, ErrInvalidParameter)
+		return nil, fmt.Errorf("%s: missing both configuration and optional LDAP URLs: %w", op, ErrInvalidParameter)
 	}
-	if len(opts.withURLs) == 0 {
-		opts.withURLs = c.conf.URLs
+	urls := opts.withURLs
+	if len(urls) == 0 {
+		urls = c.conf.URLs
 	}
+
 	var retErr *multierror.Error
+	for _, rawURL := range urls {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("%s: connection attempt canceled: %w", op, err)
+		}
+		conn, err := c.dialOne(ctx, rawURL)
+		if err == nil {
+			return conn, nil
+		}
+		retErr = multierror.Append(retErr, err)
+	}
+	if retErr == nil {
+		retErr = multierror.Append(retErr, fmt.Errorf("%s: no LDAP URLs were attempted: %w", op, ErrInvalidParameter))
+	}
+	return nil, retErr
+}
+
+// dialOne creates a connection for exactly one URL. TLS identity is derived
+// from that URL's host and the returned ldapConnection keeps the URL and host
+// attached to the connection for reporting.
+func (c *Client) dialOne(ctx context.Context, rawURL string) (*ldapConnection, error) {
+	const op = "ldap.(Client).connect"
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c == nil || c.conf == nil {
+		return nil, fmt.Errorf("%s: missing configuration: %w", op, ErrInternal)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("%s: connection attempt canceled for url %q: %w", op, rawURL, err)
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("%s: error parsing url %q: %w", op, rawURL, err)
+	}
+	host := u.Hostname()
+	if host == "" {
+		host = u.Host
+	}
+
 	var conn *ldap.Conn
-	for _, uut := range opts.withURLs {
-		u, err := url.Parse(uut)
+	var tlsConfig *tls.Config
+	switch u.Scheme {
+	case schemeLDAP:
+		conn, err = ldap.DialURL(rawURL, ldap.DialWithDialer(&net.Dialer{Timeout: c.getTimeout()}))
 		if err != nil {
-			retErr = multierror.Append(retErr, fmt.Errorf("%s: error parsing url %q: %w", op, uut, err))
-			continue
+			break
 		}
-		host, _, err := net.SplitHostPort(u.Host)
-		if err != nil {
-			host = u.Host
+		if conn == nil {
+			err = fmt.Errorf("%s: empty connection after dialing: %w", op, ErrUnknown)
+			break
 		}
-		var tlsConfig *tls.Config
-		switch u.Scheme {
-		case schemeLDAP:
-			conn, err = ldap.DialURL(uut, ldap.DialWithDialer(&net.Dialer{Timeout: c.getTimeout()}))
-			if err != nil {
-				break
-			}
-			if conn == nil {
-				err = fmt.Errorf("%s: empty connection after dialing: %w", op, ErrUnknown)
-				break
-			}
-			if c.conf.StartTLS {
-				tlsConfig, err = getTLSConfig(
-					host,
-					withInsecureTLS(c.conf.InsecureTLS),
-					withTLSMinVersion(c.conf.TLSMinVersion),
-					withTLSMaxVersion(c.conf.TLSMaxVersion),
-					withCertificates(c.conf.Certificates...),
-					withClientTLSCert(c.conf.ClientTLSCert),
-					withClientTLSKey(c.conf.ClientTLSKey),
-				)
-				if err != nil {
-					break
-				}
-				err = conn.StartTLS(tlsConfig)
-			}
-		case schemeLDAPTLS:
+		conn.SetTimeout(c.getTimeout())
+		if c.conf.StartTLS {
 			tlsConfig, err = getTLSConfig(
 				host,
 				withInsecureTLS(c.conf.InsecureTLS),
@@ -163,23 +425,55 @@ func (c *Client) connect(ctx context.Context, opt ...Option) error {
 			if err != nil {
 				break
 			}
-			conn, err = ldap.DialURL(uut, ldap.DialWithTLSDialer(tlsConfig, &net.Dialer{Timeout: c.getTimeout()}))
-		default:
-			retErr = multierror.Append(retErr, fmt.Errorf("%s: invalid LDAP scheme in url %q: %w", op, uut, ErrInvalidParameter))
-			continue
+			err = conn.StartTLS(tlsConfig)
 		}
-		if err == nil {
-			retErr = nil
+	case schemeLDAPTLS:
+		tlsConfig, err = getTLSConfig(
+			host,
+			withInsecureTLS(c.conf.InsecureTLS),
+			withTLSMinVersion(c.conf.TLSMinVersion),
+			withTLSMaxVersion(c.conf.TLSMaxVersion),
+			withCertificates(c.conf.Certificates...),
+			withClientTLSCert(c.conf.ClientTLSCert),
+			withClientTLSKey(c.conf.ClientTLSKey),
+		)
+		if err != nil {
 			break
 		}
-		retErr = multierror.Append(retErr, fmt.Errorf("%s: error connecting to host %q: %w", op, uut, err))
+		conn, err = ldap.DialURL(rawURL, ldap.DialWithTLSDialer(tlsConfig, &net.Dialer{Timeout: c.getTimeout()}))
+	default:
+		return nil, fmt.Errorf("%s: invalid LDAP scheme in url %q: %w", op, rawURL, ErrInvalidParameter)
 	}
-	if retErr != nil {
-		return retErr
+
+	if err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, fmt.Errorf("%s: error connecting to host %q: %w", op, rawURL, err)
+	}
+	if conn == nil {
+		return nil, fmt.Errorf("%s: error connecting to host %q: empty connection after dialing: %w", op, rawURL, ErrUnknown)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("%s: connection attempt canceled for url %q: %w", op, rawURL, err)
 	}
 	conn.SetTimeout(c.getTimeout())
-	c.conn = conn
-	return nil
+	return &ldapConnection{
+		conn: conn,
+		url:  rawURL,
+		host: u.Host,
+	}, nil
+}
+
+// closeConn closes and clears the Client-owned connection.
+func (c *Client) closeConn() {
+	if c == nil || c.conn == nil {
+		return
+	}
+	conn := c.conn
+	c.conn = nil
+	_ = conn.Close()
 }
 
 func (c *Client) getTimeout() time.Duration {
@@ -214,6 +508,28 @@ type AuthResult struct {
 	// attempting to find the groups associated with the authenticated user (see
 	// the WithGroups option)
 	Warnings []Warning
+
+	// Host is the host (including port when one was specified in the URL) of
+	// the directory server that produced this result.
+	Host string
+
+	// URL is the exact LDAP URL selected for this result.
+	URL string
+
+	// BindDN is the DN of the authenticated user's successful bind.
+	BindDN string
+
+	// GroupBindDN is the identity bound when the group query ran. It can differ
+	// from BindDN when a service BindDN or an anonymous group search is used. An
+	// empty value can mean an anonymous empty-DN bind or that no group query was
+	// requested; URL, Host and Generation distinguish the attempts.
+	GroupBindDN string
+
+	// Generation identifies the immutable authentication attempt that produced
+	// this result. A retry or failover always uses a new generation, so Groups,
+	// BindDN, Host and UserDN cannot be stitched together from different
+	// attempts.
+	Generation uint64
 }
 
 type Attribute struct {
@@ -231,6 +547,12 @@ type Attribute struct {
 // WithLowerUserAttributeKeys, WithEmptyAnonymousGroupSearch
 func (c *Client) Authenticate(ctx context.Context, username, password string, opt ...Option) (*AuthResult, error) {
 	const op = "ldap.(Client).Authenticate"
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c == nil || c.conf == nil {
+		return nil, fmt.Errorf("%s: missing configuration: %w", op, ErrInternal)
+	}
 	if username == "" {
 		return nil, fmt.Errorf("%s: missing username: %w", op, ErrInvalidParameter)
 	}
@@ -238,110 +560,166 @@ func (c *Client) Authenticate(ctx context.Context, username, password string, op
 		return nil, fmt.Errorf("%s: password cannot be of zero length if allow_empty_passwd_bind is not enabled: %w", op, ErrInvalidParameter)
 	}
 
-	if err := c.connect(ctx, opt...); err != nil {
-		return nil, fmt.Errorf("%s: failed to connect: %w", op, err)
+	opts := getConfigOpts(opt...)
+	conf, err := c.conf.clone()
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+	urls := append([]string(nil), conf.URLs...)
+	if len(opts.withURLs) > 0 {
+		urls = append([]string(nil), opts.withURLs...)
+	}
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("%s: missing both configuration and optional LDAP URLs: %w", op, ErrInvalidParameter)
 	}
 
-	userBindDN, err := c.getUserBindDN(username)
+	// Authenticate never reuses the Client-owned connection. Retire it so a
+	// legacy direct connect cannot leave an old bind identity around.
+	c.closeConn()
+
+	var attemptErrs *multierror.Error
+	var anyConnected bool
+	for _, rawURL := range urls {
+		if err := ctx.Err(); err != nil {
+			if attemptErrs != nil && len(attemptErrs.Errors) > 0 {
+				attemptErrs = multierror.Append(attemptErrs, fmt.Errorf("authentication canceled before url %q: %w", rawURL, err))
+				return nil, fmt.Errorf("%s: authentication canceled after %d URL attempt(s): %w", op, len(attemptErrs.Errors), attemptErrs)
+			}
+			return nil, fmt.Errorf("%s: authentication canceled: %w", op, err)
+		}
+
+		attempt := newAuthAttempt(conf, rawURL, c.dialFunc)
+		result, retryable, err := c.authenticateAttempt(ctx, attempt, opts, username, password)
+		closeErr := attempt.close()
+		if err == nil {
+			return result, nil
+		}
+		anyConnected = anyConnected || attempt.connected
+		attemptErrs = multierror.Append(attemptErrs, err)
+		if closeErr != nil {
+			attemptErrs = multierror.Append(attemptErrs, fmt.Errorf("%s: closing connection for generation %d failed: %w", op, attempt.id, closeErr))
+		}
+		if !retryable {
+			if len(attemptErrs.Errors) == 1 {
+				return nil, err
+			}
+			return nil, fmt.Errorf("%s: LDAP authentication failed: %w", op, attemptErrs)
+		}
+	}
+
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, fmt.Errorf("%s: authentication canceled: %w", op, ctxErr)
+	}
+	if !anyConnected {
+		return nil, fmt.Errorf("%s: failed to connect: %w", op, attemptErrs)
+	}
+	return nil, fmt.Errorf("%s: LDAP URL recovery failed after %d attempt(s): %w", op, len(urls), attemptErrs)
+}
+
+// authenticateAttempt performs the complete authentication flow against one
+// URL generation. A retryable failure means the caller may start a new
+// generation for another URL; the failed generation's connection, bind identity
+// and group state are never reused.
+func (c *Client) authenticateAttempt(ctx context.Context, attempt *authAttempt, opts configOptions, username, password string) (*AuthResult, bool, error) {
+	const op = "ldap.(Client).Authenticate"
+	if err := attempt.connect(ctx); err != nil {
+		return nil, true, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, fmt.Errorf("%s: authentication canceled before bind (host %q / generation %d): %w", op, attempt.host, attempt.id, err)
+	}
+
+	userBindDN, err := attempt.client.getUserBindDN(username)
 	if err != nil {
-		return nil, fmt.Errorf("%s: discovery of user bind DN failed: %w", op, err)
+		return nil, isRetryableLDAPError(err), fmt.Errorf("%s: discovery of user bind DN failed (host %q / generation %d): %w", op, attempt.host, attempt.id, err)
 	}
 
 	// Try to bind as the login user. This is where the actual authentication takes place.
 	if len(password) > 0 {
-		err = c.conn.Bind(userBindDN, password)
+		err = attempt.client.conn.Bind(userBindDN, password)
 	} else {
-		err = c.conn.UnauthenticatedBind(userBindDN)
+		err = attempt.client.conn.UnauthenticatedBind(userBindDN)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%s: unable to bind user: %w", op, err)
+		return nil, isRetryableLDAPError(err), fmt.Errorf("%s: unable to bind user (host %q / generation %d / bind DN %q): %w", op, attempt.host, attempt.id, userBindDN, err)
 	}
-	opts := getConfigOpts(opt...)
-	if !opts.withGroups && !c.conf.IncludeUserGroups &&
-		!opts.withUserAttributes && !c.conf.IncludeUserAttributes {
-		return &AuthResult{
-			Success: true,
-		}, nil
+	attempt.userBindDN = userBindDN
+
+	if !opts.withGroups && !attempt.conf.IncludeUserGroups &&
+		!opts.withUserAttributes && !attempt.conf.IncludeUserAttributes {
+		return attempt.result("", nil, nil, nil), false, nil
 	}
 
 	// We re-bind to the BindDN if it's defined because we assume the BindDN
 	// should be the one to search, not the user authenticating.
-	if c.conf.BindDN != "" && c.conf.BindPassword != "" {
-		if err := c.conn.Bind(c.conf.BindDN, c.conf.BindPassword); err != nil {
+	if attempt.conf.BindDN != "" && attempt.conf.BindPassword != "" {
+		if err := attempt.client.conn.Bind(attempt.conf.BindDN, attempt.conf.BindPassword); err != nil {
 			// unless the binddn was changed during this inflight authentication
 			// flow, it should be very difficult to encounter this error
-			return nil, fmt.Errorf("%s: unable to re-bind with the configuration BindDN user: %w", op, err)
+			return nil, isRetryableLDAPError(err), fmt.Errorf("%s: unable to re-bind with the configuration BindDN user (host %q / generation %d / bind DN %q): %w", op, attempt.host, attempt.id, attempt.conf.BindDN, err)
 		}
 	}
 
-	userDN, err := c.getUserDN(userBindDN, username)
+	userDN, err := attempt.client.getUserDN(userBindDN, username)
 	if err != nil {
-		return nil, fmt.Errorf("%s: failed to get the DN for the authenticated user: %w", op, err)
+		return nil, isRetryableLDAPError(err), fmt.Errorf("%s: failed to get the DN for the authenticated user (host %q / generation %d / bind DN %q): %w", op, attempt.host, attempt.id, userBindDN, err)
 	}
 
-	userAttrs := map[string][]string{}
-	if c.conf.IncludeUserAttributes || opts.withUserAttributes {
-		attrs, err := c.getUserAttributes(userDN)
+	var userAttrs map[string][]string
+	includeUserAttributes := attempt.conf.IncludeUserAttributes || opts.withUserAttributes
+	if includeUserAttributes {
+		userAttrs = map[string][]string{}
+		attrs, err := attempt.client.getUserAttributes(userDN)
 		if err != nil {
-			return nil, fmt.Errorf("%s: failed to get user attributes: %w", op, err)
+			return nil, isRetryableLDAPError(err), fmt.Errorf("%s: failed to get user attributes (host %q / generation %d / bind DN %q): %w", op, attempt.host, attempt.id, userBindDN, err)
 		}
 		for _, a := range attrs {
 			name := a.Name
-			if c.conf.LowerUserAttributeKeys || opts.withLowerUserAttributeKeys {
+			if attempt.conf.LowerUserAttributeKeys || opts.withLowerUserAttributeKeys {
 				name = strings.ToLower(a.Name)
 			}
 			userAttrs[name] = a.Vals
 		}
 	}
-	if !opts.withGroups && !c.conf.IncludeUserGroups {
-		return &AuthResult{
-			Success:        true,
-			UserDN:         userDN,
-			UserAttributes: userAttrs,
-		}, nil
+	if !opts.withGroups && !attempt.conf.IncludeUserGroups {
+		return attempt.result(userDN, userAttrs, nil, nil), false, nil
 	}
 
-	if c.conf.AnonymousGroupSearch {
+	if attempt.conf.AnonymousGroupSearch {
 		// Some LDAP servers will reject anonymous group searches if userDN is
 		// included in the query.
 		dn := userDN
-		if c.conf.AllowEmptyAnonymousGroupSearch || opts.withEmptyAnonymousGroupSearch {
+		if attempt.conf.AllowEmptyAnonymousGroupSearch || opts.withEmptyAnonymousGroupSearch {
 			dn = ""
 		}
 
-		if err := c.conn.UnauthenticatedBind(dn); err != nil {
-			return nil, fmt.Errorf("%s: group search anonymous bind failed: %w", op, err)
+		if err := attempt.client.conn.UnauthenticatedBind(dn); err != nil {
+			return nil, isRetryableLDAPError(err), fmt.Errorf("%s: group search anonymous bind failed (host %q / generation %d / user DN %q / bind DN %q): %w", op, attempt.host, attempt.id, userDN, dn, err)
 		}
 	}
 
-	ldapGroups, warnings, err := c.getGroups(userDN, username)
-	if err != nil {
-		return nil, fmt.Errorf("%s: unable to get user groups: %w", op, err)
+	groupBinding := attempt.conn.lastBinding()
+	if groupBinding.hasIdentity {
+		attempt.groupBindDN = groupBinding.dn
 	}
 
-	switch {
-	case c.conf.IncludeUserAttributes || opts.withUserAttributes:
-		return &AuthResult{
-			Success:        true,
-			UserDN:         userDN,
-			UserAttributes: userAttrs,
-			Groups:         ldapGroups,
-			Warnings:       warnings,
-		}, nil
-	default:
-		return &AuthResult{
-			Success:  true,
-			Groups:   ldapGroups,
-			Warnings: warnings,
-		}, nil
+	ldapGroups, warnings, err := attempt.client.getGroups(userDN, username)
+	if err != nil {
+		return nil, isRetryableLDAPError(err), fmt.Errorf("%s: unable to get user groups (host %q / generation %d / user DN %q / bind DN %q / group bind DN %q): %w", op, attempt.host, attempt.id, userDN, userBindDN, attempt.groupBindDN, err)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, fmt.Errorf("%s: authentication canceled after group query (host %q / generation %d / user DN %q / bind DN %q / group bind DN %q): %w", op, attempt.host, attempt.id, userDN, userBindDN, attempt.groupBindDN, err)
+	}
+
+	if includeUserAttributes {
+		return attempt.result(userDN, userAttrs, ldapGroups, warnings), false, nil
+	}
+	return attempt.result("", nil, ldapGroups, warnings), false, nil
 }
 
 // Close will close the client's connection to the directory service.
 func (c *Client) Close(ctx context.Context) {
-	if c.conn != nil {
-		c.conn.Close()
-	}
+	c.closeConn()
 }
 
 func (c *Client) getUserAttributes(userDN string) ([]Attribute, error) {
@@ -845,6 +1223,137 @@ func (c *Client) renderUserSearchFilter(username string) (string, error) {
 	}
 
 	return renderedFilter.String(), nil
+}
+
+// runWithContext runs a blocking LDAP operation in one goroutine and closes the
+// attempt's connection if the caller cancels the operation. The buffered
+// result channel lets the operation goroutine exit even if cancellation wins
+// the select.
+func runWithContext(ctx context.Context, cancel func() error, operation func() error) error {
+	if operation == nil {
+		return nil
+	}
+	if ctx == nil || ctx.Done() == nil {
+		return operation()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- operation()
+	}()
+
+	select {
+	case <-ctx.Done():
+		if cancel != nil {
+			go func() { _ = cancel() }()
+		}
+		return ctx.Err()
+	case err := <-result:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
+	}
+}
+
+// runSearchWithContext is runWithContext for searches, which return a value in
+// addition to an error.
+func runSearchWithContext(ctx context.Context, cancel func() error, operation func() (*ldap.SearchResult, error)) (*ldap.SearchResult, error) {
+	if operation == nil {
+		return nil, nil
+	}
+	if ctx == nil || ctx.Done() == nil {
+		return operation()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	type searchResult struct {
+		result *ldap.SearchResult
+		err    error
+	}
+	results := make(chan searchResult, 1)
+	go func() {
+		result, err := operation()
+		results <- searchResult{result: result, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		if cancel != nil {
+			go func() { _ = cancel() }()
+		}
+		return nil, ctx.Err()
+	case result := <-results:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return result.result, result.err
+	}
+}
+
+// isRetryableLDAPError classifies errors that can safely be retried on another
+// directory URL. Credential and request-shape failures are deliberately not
+// retryable, while transport failures, restarts and server-unavailable
+// responses are.
+func isRetryableLDAPError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		// A per-operation request timeout can be recovered on another URL. If
+		// the caller's context expired instead, the URL loop observes ctx.Err()
+		// before starting another attempt.
+		return true
+	}
+
+	var ldapErr *ldap.Error
+	if errors.As(err, &ldapErr) {
+		switch ldapErr.ResultCode {
+		case ldap.ErrorNetwork,
+			ldap.LDAPResultTimeLimitExceeded,
+			ldap.LDAPResultBusy,
+			ldap.LDAPResultUnavailable,
+			ldap.LDAPResultServerDown,
+			ldap.LDAPResultTimeout,
+			ldap.LDAPResultConnectError,
+			ldap.LDAPResultProtocolError:
+			return true
+		default:
+			return false
+		}
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	errText := strings.ToLower(err.Error())
+	for _, fragment := range []string{
+		"connection reset",
+		"connection refused",
+		"broken pipe",
+		"connection closed",
+		"unexpected eof",
+		"server closed",
+		"connection timed out",
+		"i/o timeout",
+	} {
+		if strings.Contains(errText, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func getTLSConfig(host string, opt ...Option) (*tls.Config, error) {

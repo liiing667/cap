@@ -62,6 +62,21 @@ group membership. The configuration options are categorized and detailed below.
 * `ClientTLSKey` (string, optional) - Client certificate key to provide to the
   LDAP server, must be x509 PEM encoded.
 
+Each authentication attempt is isolated in its own recovery generation. The
+selected URL, its TLS configuration and connection, the bind identity, the group
+collection, and the returned `AuthResult` all come from that generation. If an
+LDAP operation fails because a server becomes unavailable after a successful
+bind, the client discards the whole generation and starts the next configured
+URL from the beginning. It never reuses the previous connection, TLS identity,
+bind DN, or group list. Cancellation and timeouts fail the generation
+explicitly; a partially recovered result is never returned.
+
+Successful results identify the source of the data with `AuthResult.Host`,
+`AuthResult.URL`, `AuthResult.BindDN`, `AuthResult.GroupBindDN`, and
+`AuthResult.Generation`. `BindDN` is the authenticated user's bind identity.
+`GroupBindDN` is the identity that performed the group search (which can be a
+service account or an anonymous bind).
+
 ### Binding parameters
 
 There are two alternate methods of resolving the user object used to
