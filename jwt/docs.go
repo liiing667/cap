@@ -17,6 +17,12 @@ JWT signature verification is supported by providing keys from the following sou
   - OIDC Discovery mechanism
   - Local public keys
 
+Validator.ValidateWithReport returns a ValidationReport that identifies the
+issuer, JWS alg and kid, key set source, key set generation, and failure stage
+for one validation attempt. Remote JWKS refreshes are published as complete
+generations, so a token is never verified against one generation and reported
+against another.
+
 JWT signature verification supports the following asymmetric algorithms as defined in
 https://www.rfc-editor.org/rfc/rfc7518.html#section-3.1:
 

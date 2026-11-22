@@ -137,6 +137,20 @@ func (v *Validator) Validate(ctx context.Context, token string, expected Expecte
 	return v.validateAll(ctx, token, expected, false)
 }
 
+// ValidateWithReport validates a JWT and returns the structured report for the
+// validation attempt. The report is built from one key set snapshot, so its
+// issuer, alg, kid, key set source, key set generation, and result cannot be
+// mixed across a refresh.
+func (v *Validator) ValidateWithReport(ctx context.Context, token string, expected Expected) (map[string]interface{}, *ValidationReport, error) {
+	claims, report, err := v.validateAllWithReport(ctx, token, expected, false)
+	return claims, report, wrapValidationError(report, err)
+}
+
+// ValidateReport is an alias for ValidateWithReport.
+func (v *Validator) ValidateReport(ctx context.Context, token string, expected Expected) (map[string]interface{}, *ValidationReport, error) {
+	return v.ValidateWithReport(ctx, token, expected)
+}
+
 // ValidateAllowMissingIatNbfExp validates JWTs of the JWS compact serialization form.
 //
 // The given JWT is considered valid if:
@@ -153,60 +167,139 @@ func (v *Validator) ValidateAllowMissingIatNbfExp(ctx context.Context, token str
 	return v.validateAll(ctx, token, expected, true)
 }
 
-func (v *Validator) validateAll(ctx context.Context, token string, expected Expected, allowMissingIatExpNbf bool) (map[string]interface{}, error) {
-	var allClaims map[string]interface{}
-	var err error
+// ValidateAllowMissingIatNbfExpWithReport is the report-returning variant of
+// ValidateAllowMissingIatNbfExp.
+func (v *Validator) ValidateAllowMissingIatNbfExpWithReport(ctx context.Context, token string, expected Expected) (map[string]interface{}, *ValidationReport, error) {
+	claims, report, err := v.validateAllWithReport(ctx, token, expected, true)
+	return claims, report, wrapValidationError(report, err)
+}
 
-	// Ensure that the token is signed by at least one of the given key sets
+func (v *Validator) validateAll(ctx context.Context, token string, expected Expected, allowMissingIatExpNbf bool) (map[string]interface{}, error) {
+	claims, report, err := v.validateAllWithReport(ctx, token, expected, allowMissingIatExpNbf)
+	return claims, wrapValidationError(report, err)
+}
+
+func (v *Validator) validateAllWithReport(ctx context.Context, token string, expected Expected, allowMissingIatExpNbf bool) (map[string]interface{}, *ValidationReport, error) {
+	report := &ValidationReport{
+		KeySetReport: KeySetReport{
+			Issuer:       expected.Issuer,
+			FailureStage: StageParseToken,
+		},
+	}
+	defer func() {
+		report.syncAliases()
+	}()
+
+	// Parse once up front so a failure report always carries the token's actual
+	// alg and kid, even when key set lookup, refresh, or signature verification
+	// fails later. For the static key set path, parse errors are left to the key
+	// sets so custom KeySet implementations retain their existing behavior.
+	jws, parseErr := jose.ParseSigned(token, joseSignatureAlgorithms())
+	if tokenIssuer := unverifiedIssuer(token); tokenIssuer != "" {
+		report.Issuer = tokenIssuer
+	}
+	if kid, alg := unverifiedHeader(token); kid != "" || alg != "" {
+		report.Kid = kid
+		report.Alg = alg
+	}
+	if parseErr == nil && len(jws.Signatures) > 0 && len(jws.Signatures) <= 1 {
+		if kid := jws.Signatures[0].Header.KeyID; kid != "" {
+			report.Kid = kid
+		}
+		if alg := Alg(jws.Signatures[0].Header.Algorithm); alg != "" {
+			report.Alg = alg
+		}
+	}
+
+	var err error
+	if v.keySearcher != nil && parseErr != nil {
+		return nil, report, fmt.Errorf("error parsing token: %w", parseErr)
+	}
+	if v.keySearcher != nil && len(jws.Signatures) == 0 {
+		report.FailureStage = StageSignature
+		return nil, report, fmt.Errorf("token must be signed")
+	}
+	if v.keySearcher != nil && len(jws.Signatures) > 1 {
+		report.FailureStage = StageSignature
+		return nil, report, fmt.Errorf("token with multiple signatures not supported")
+	}
+
+	var allClaims map[string]interface{}
 	var tokenVerified bool
 
 	if v.keySearcher != nil {
 		// Use the KeySetSearcher callback to dynamically locate the appropriate KeySet based on the JWT's kid header
-		var jws *jose.JSONWebSignature
-		jws, err = jose.ParseSigned(token, joseSignatureAlgorithms())
-		if err != nil {
-			return nil, fmt.Errorf("error parsing token: %w", err)
-		}
-		if len(jws.Signatures) == 0 {
-			return nil, fmt.Errorf("token must be signed")
-		}
-		if len(jws.Signatures) > 1 {
-			return nil, fmt.Errorf("token with multiple signatures not supported")
-		}
-
-		// Extract the kid (key ID) from the JWS header to locate the appropriate KeySet
-		keyID := jws.Signatures[0].Header.KeyID
-		if keyID == "" {
-			return nil, fmt.Errorf("token missing kid header parameter")
+		if report.Kid == "" {
+			report.FailureStage = StageKeyID
+			return nil, report, fmt.Errorf("token missing kid header parameter")
 		}
 
 		var keySet KeySet
-		keySet, err = v.keySearcher(ctx, keyID)
+		keySet, err = v.keySearcher(ctx, report.Kid)
 		if err != nil {
-			return nil, fmt.Errorf("error searching for key set with kid %s: %w", keyID, err)
+			report.FailureStage = StageKeySetLookup
+			return nil, report, fmt.Errorf("error searching for key set with kid %s: %w", report.Kid, err)
 		}
 		if keySet == nil {
-			return nil, fmt.Errorf("no key set found with kid %s", keyID)
+			report.FailureStage = StageKeySetLookup
+			return nil, report, fmt.Errorf("no key set found with kid %s", report.Kid)
 		}
 
-		allClaims, err = keySet.VerifySignature(ctx, token)
+		fillKeySetReport(report, keySet)
+		allClaims, err = verifyKeySetSignature(ctx, keySet, token, report)
 		if err == nil {
 			tokenVerified = true
+		} else {
+			report.Verified = false
+			report.FailureStage = failureStageFromError(err, StageSignature)
 		}
 	} else {
 		// Ensure that the token is signed by at least one of the given key sets
+		report.FailureStage = StageSignature
+		baseIssuer, baseAlg, baseKid := report.Issuer, report.Alg, report.Kid
 		for _, keySet := range v.keySets {
+			// Reset per-key-set evidence so a failed attempt cannot leak into
+			// the report for the key set that actually verifies the token.
+			report.Issuer = baseIssuer
+			report.Alg = baseAlg
+			report.Kid = baseKid
+			report.Verified = false
+			report.FailureStage = StageSignature
+			report.RefreshError = ""
+			fillKeySetReport(report, keySet)
+
 			// First, verify the signature to ensure subsequent validation is against verified claims
-			allClaims, err = keySet.VerifySignature(ctx, token)
+			allClaims, err = verifyKeySetSignature(ctx, keySet, token, report)
 			if err == nil {
 				tokenVerified = true
 				break
+			}
+			report.FailureStage = failureStageFromError(err, StageSignature)
+		}
+		if !tokenVerified && err == nil {
+			if parseErr != nil {
+				err = parseErr
+			} else {
+				err = errors.New("no key sets configured")
 			}
 		}
 	}
 
 	if !tokenVerified {
-		return nil, fmt.Errorf("error verifying token signature: %w", err)
+		if report.FailureStage == "" {
+			report.FailureStage = StageSignature
+		}
+		return nil, report, fmt.Errorf("error verifying token signature: %w", err)
+	}
+
+	// The key set reported Verified=true for the signature stage only. The
+	// complete validation result is set after all claims checks pass.
+	report.Verified = false
+	if issuer, ok := allClaims["iss"].(string); ok {
+		report.Issuer = issuer
+		report.IssuerVerified = true
+	} else if expected.Issuer != "" {
+		report.Issuer = expected.Issuer
 	}
 
 	// Guard against claims-confusion before trusting the struct-based
@@ -218,45 +311,55 @@ func (v *Validator) validateAll(ctx context.Context, token string, expected Expe
 	// validated via the struct can differ from the value the caller reads from
 	// the map. Reject such tokens.
 	if err := checkRegisteredClaimCollisions(allClaims); err != nil {
-		return nil, err
+		report.FailureStage = StageClaims
+		return nil, report, err
 	}
 
 	// Validate the signing algorithm in the JWS header
 	if err := validateSigningAlgorithm(token, expected.SigningAlgorithms); err != nil {
-		return nil, fmt.Errorf("invalid algorithm (alg) header parameter: %w", err)
+		report.FailureStage = StageAlgorithm
+		return nil, report, fmt.Errorf("invalid algorithm (alg) header parameter: %w", err)
 	}
 
 	// Unmarshal all claims into the set of public JWT registered claims
 	claims := jwt.Claims{}
 	allClaimsJSON, err := json.Marshal(allClaims)
 	if err != nil {
-		return nil, err
+		report.FailureStage = StageClaims
+		return nil, report, err
 	}
 	if err := json.Unmarshal(allClaimsJSON, &claims); err != nil {
-		return nil, err
+		report.FailureStage = StageClaims
+		return nil, report, err
 	}
 
 	// Validate claims by asserting that they're as expected
 	if expected.Issuer != "" && expected.Issuer != claims.Issuer {
-		return nil, fmt.Errorf("invalid issuer (iss) claim")
+		report.FailureStage = StageIssuer
+		return nil, report, fmt.Errorf("invalid issuer (iss) claim")
 	}
 	if expected.Subject != "" && expected.Subject != claims.Subject {
-		return nil, fmt.Errorf("invalid subject (sub) claim")
+		report.FailureStage = StageSubject
+		return nil, report, fmt.Errorf("invalid subject (sub) claim")
 	}
 	if expected.ID != "" && expected.ID != claims.ID {
-		return nil, fmt.Errorf("invalid ID (jti) claim")
+		report.FailureStage = StageID
+		return nil, report, fmt.Errorf("invalid ID (jti) claim")
 	}
 	if err := validateAudience(expected.Audiences, claims.Audience); err != nil {
-		return nil, fmt.Errorf("invalid audience (aud) claim: %w", err)
+		report.FailureStage = StageAudience
+		return nil, report, fmt.Errorf("invalid audience (aud) claim: %w", err)
 	}
 
 	// At least one of the "nbf" (Not Before), "exp" (Expiration Time), or "iat" (Issued At)
 	// claims are required to be set unless allowMissingIatExpNbf is set.
 	if claims.IssuedAt == nil && claims.Expiry == nil && claims.NotBefore == nil {
 		if allowMissingIatExpNbf {
-			return allClaims, nil
+			finishReport(report, allClaims)
+			return allClaims, report, nil
 		}
-		return nil, errors.New("no issued at (iat), not before (nbf), or expiration time (exp) claims in token")
+		report.FailureStage = StageTimeClaims
+		return nil, report, errors.New("no issued at (iat), not before (nbf), or expiration time (exp) claims in token")
 	}
 
 	// If "exp" (Expiration Time) is not set, then set it to the latest of
@@ -312,16 +415,97 @@ func (v *Validator) validateAll(ctx context.Context, token string, expected Expe
 		now = expected.Now()
 	}
 	if claims.NotBefore != nil && now.Add(cksLeeway).Before(claims.NotBefore.Time()) {
-		return nil, errors.New("invalid not before (nbf) claim: token not yet valid")
+		report.FailureStage = StageTimeClaims
+		return nil, report, errors.New("invalid not before (nbf) claim: token not yet valid")
 	}
 	if claims.Expiry != nil && now.Add(-cksLeeway).After(claims.Expiry.Time()) {
-		return nil, errors.New("invalid expiration time (exp) claim: token is expired")
+		report.FailureStage = StageTimeClaims
+		return nil, report, errors.New("invalid expiration time (exp) claim: token is expired")
 	}
 	if claims.IssuedAt != nil && now.Add(cksLeeway).Before(claims.IssuedAt.Time()) {
-		return nil, errors.New("invalid issued at (iat) claim: token issued in the future")
+		report.FailureStage = StageTimeClaims
+		return nil, report, errors.New("invalid issued at (iat) claim: token issued in the future")
 	}
 
-	return allClaims, nil
+	finishReport(report, allClaims)
+	return allClaims, report, nil
+}
+
+func wrapValidationError(report *ValidationReport, err error) error {
+	if err == nil {
+		return nil
+	}
+	if report != nil {
+		report.Err = err
+		report.KeySetReport.Err = err
+	}
+	return &ValidationError{ValidationReport: report, Report: report, Err: err}
+}
+
+func fillKeySetReport(report *ValidationReport, keySet KeySet) {
+	report.KeySetSource = KeySetSource(keySet)
+	report.KeySetGeneration = KeySetGeneration(keySet)
+}
+
+func verifyKeySetSignature(ctx context.Context, keySet KeySet, token string, report *ValidationReport) (map[string]interface{}, error) {
+	if reporting, ok := keySet.(ReportingKeySet); ok {
+		claims, keySetReport, err := reporting.VerifySignatureWithReport(ctx, token)
+		mergeKeySetReport(report, keySetReport)
+		if err != nil {
+			report.FailureStage = failureStageFromError(err, keySetReport.FailedStage())
+		}
+		return claims, err
+	}
+
+	claims, err := keySet.VerifySignature(ctx, token)
+	return claims, err
+}
+
+func mergeKeySetReport(report *ValidationReport, keySetReport KeySetReport) {
+	if report.Issuer == "" && keySetReport.Issuer != "" {
+		report.Issuer = keySetReport.Issuer
+	}
+	if report.Alg == "" {
+		if keySetReport.Alg != "" {
+			report.Alg = keySetReport.Alg
+		} else if keySetReport.Algorithm != "" {
+			report.Alg = Alg(keySetReport.Algorithm)
+		}
+	}
+	if report.Kid == "" {
+		if keySetReport.Kid != "" {
+			report.Kid = keySetReport.Kid
+		} else if keySetReport.KeyID != "" {
+			report.Kid = keySetReport.KeyID
+		}
+	}
+	if source := keySetReport.KeySetSource; source != "" {
+		report.KeySetSource = source
+	} else if keySetReport.Source != "" {
+		report.KeySetSource = keySetReport.Source
+	}
+	if generation := keySetReport.KeySetGeneration; generation != 0 {
+		report.KeySetGeneration = generation
+	} else if keySetReport.Generation != 0 {
+		report.KeySetGeneration = keySetReport.Generation
+	}
+	if stage := keySetReport.FailedStage(); stage != "" {
+		report.FailureStage = stage
+	}
+	if keySetReport.RefreshError != "" {
+		report.RefreshError = keySetReport.RefreshError
+	}
+	report.Verified = keySetReport.Verified || keySetReport.Valid
+}
+
+func finishReport(report *ValidationReport, allClaims map[string]interface{}) {
+	report.Verified = true
+	report.FailureStage = ""
+	report.Claims = allClaims
+	if issuer, ok := allClaims["iss"].(string); ok {
+		report.Issuer = issuer
+		report.IssuerVerified = true
+	}
 }
 
 // checkRegisteredClaimCollisions guards against a claims-confusion that arises
