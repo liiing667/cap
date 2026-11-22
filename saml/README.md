@@ -58,3 +58,28 @@ required signature policy is controlled by options:
     signed, each assertion must be signed and valid.
 - Using both options requires a valid response signature and validates any
     assertion signatures that are present.
+
+## Request and metadata generations
+
+`CreateAuthnRequest`, `AuthnRequestPost`, and `AuthnRequestRedirect` freeze the
+metadata generation used for the request. The generation contains the IdP
+issuer, the signing certificate set, the certificate fingerprints, and the SSO
+destinations. `ParseResponse` uses that frozen generation instead of reloading
+metadata, so a metadata refresh failure, a tenant change, or a process restart
+cannot pair one tenant's issuer with another tenant's certificate.
+
+A request is consumed once a response has been accepted. Replaying the same
+request ID is rejected with `ErrRequestStateConsumed`. Callers that persist
+authentication sessions can store the value returned by `ServiceProvider.RequestState`
+and restore it with `ServiceProvider.RestoreRequestState` after a restart.
+Reusing an unconsumed request ID keeps the original metadata generation,
+RelayState, and ACS binding instead of silently replacing them.
+`ParseACSResponse` additionally binds the ACS `RelayState` to the value stored
+with the request. The ACS handler requires a matching recoverable request
+state once the provider has issued an AuthnRequest; a fresh provider that only
+uses manually managed requests keeps the historical behavior.
+
+`WithStale(true)` continues to allow a complete, still-valid metadata snapshot
+to be used when a refresh fails. Metadata snapshots are replaced atomically:
+an update is either not visible at all or is visible with its full issuer and
+certificate set.

@@ -37,6 +37,8 @@ type authnRequestOptions struct {
 	authnContextClassRefs       []string
 	indent                      int
 	assertionConsumerServiceURL string
+	cache                       bool
+	useStale                    bool
 }
 
 func authnRequestOptionsDefault() authnRequestOptions {
@@ -46,6 +48,7 @@ func authnRequestOptionsDefault() authnRequestOptions {
 		nameIDFormat:    core.NameIDFormat(""),
 		forceAuthn:      false,
 		protocolBinding: core.ServiceBindingHTTPPost,
+		cache:           true,
 	}
 }
 
@@ -177,14 +180,89 @@ func (sp *ServiceProvider) CreateAuthnRequest(
 
 	opts := getAuthnRequestOptions(opt...)
 
-	destination, err := sp.destination(binding)
-	if err != nil {
+	now := opts.clock.Now()
+	state, hasState := sp.RequestState(id)
+	var destination string
+	var ok bool
+	switch {
+	case hasState && state.Consumed():
 		return nil, fmt.Errorf(
-			"%s: failed to get destination for given service binding (%s): %w",
+			"%s: request ID %q was already consumed: %w",
 			op,
-			binding,
-			err,
+			id,
+			ErrRequestStateConsumed,
 		)
+	case hasState && state.Expired(now):
+		return nil, fmt.Errorf(
+			"%s: request ID %q is bound to an expired metadata generation: %w",
+			op,
+			id,
+			ErrRequestStateExpired,
+		)
+	case hasState:
+		destination, ok = state.Destinations[binding]
+		if !ok {
+			return nil, fmt.Errorf(
+				"%s: failed to get destination for given service binding (%s): %w",
+				op,
+				binding,
+				fmt.Errorf(
+					"%s: no location for provided binding (%s) found: %w",
+					"saml.ServiceProvider.destination",
+					binding,
+					ErrBindingUnsupported,
+				),
+			)
+		}
+	default:
+		snap, err := sp.idpMetadataSnapshot(
+			WithCache(opts.cache),
+			WithStale(opts.useStale),
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"%s: failed to get destination for given service binding (%s): %w",
+				op,
+				binding,
+				fmt.Errorf("%s: failed to fetch metadata: %w", "saml.ServiceProvider.destination", err),
+			)
+		}
+		destination, ok = snap.destinations[binding]
+		if !ok {
+			return nil, fmt.Errorf(
+				"%s: failed to get destination for given service binding (%s): %w",
+				op,
+				binding,
+				fmt.Errorf(
+					"%s: no location for provided binding (%s) found: %w",
+					"saml.ServiceProvider.destination",
+					binding,
+					ErrBindingUnsupported,
+				),
+			)
+		}
+		state = newRequestState(id, "", binding, snap, now, sp.cfg.EntityID)
+		registered, created, err := sp.runtime.putRequest(state)
+		if err != nil {
+			return nil, fmt.Errorf("%s: unable to register request state: %w", op, err)
+		}
+		if !created {
+			destination, ok = registered.Destinations[binding]
+			if !ok {
+				return nil, fmt.Errorf(
+					"%s: failed to get destination for given service binding (%s): %w",
+					op,
+					binding,
+					fmt.Errorf(
+						"%s: no location for provided binding (%s) found: %w",
+						"saml.ServiceProvider.destination",
+						binding,
+						ErrBindingUnsupported,
+					),
+				)
+			}
+		}
+		state = registered
 	}
 
 	ar := &core.AuthnRequest{}
@@ -197,16 +275,29 @@ func (sp *ServiceProvider) CreateAuthnRequest(
 	// "The message SHOULD contain an AssertionConsumerServiceURL attribute and MUST NOT contain an
 	// AssertionConsumerServiceIndex attribute (i.e., the desired endpoint MUST be the default,
 	// or identified via the AssertionConsumerServiceURL attribute)."
-	ar.AssertionConsumerServiceURL = sp.cfg.AssertionConsumerServiceURL
-	if opts.assertionConsumerServiceURL != "" {
+	switch {
+	case hasState && opts.assertionConsumerServiceURL == "" && state.AssertionConsumerServiceURL != "":
+		ar.AssertionConsumerServiceURL = state.AssertionConsumerServiceURL
+	case opts.assertionConsumerServiceURL != "":
 		ar.AssertionConsumerServiceURL = opts.assertionConsumerServiceURL
+	default:
+		ar.AssertionConsumerServiceURL = sp.cfg.AssertionConsumerServiceURL
 	}
+	sp.runtime.setAssertionConsumerServiceURL(id, ar.AssertionConsumerServiceURL)
+	sp.runtime.setServiceProviderEntityID(id, sp.cfg.EntityID)
 
-	ar.IssueInstant = opts.clock.Now().Truncate(time.Microsecond).UTC()
+	ar.IssueInstant = now.Truncate(time.Microsecond).UTC()
 	ar.Destination = destination
 
 	ar.Issuer = &core.Issuer{}
 	ar.Issuer.Value = sp.cfg.EntityID
+	if hasState && state.ServiceProviderEntityID != "" {
+		ar.Issuer.Value = state.ServiceProviderEntityID
+	}
+	ar.RelayState = state.RelayState
+	ar.MetadataGeneration = state.MetadataGeneration
+	ar.MetadataIssuer = state.Issuer
+	ar.CertificateFingerprints = append([]string(nil), state.CertificateFingerprints...)
 
 	// [INT_SAML][SDP-SP04]
 	// "The <samlp:AuthnRequest> message MUST either omit the <samlp:NameIDPolicy> element (RECOMMENDED),
@@ -254,14 +345,19 @@ func (sp *ServiceProvider) AuthnRequestPost(
 		)
 	}
 
-	authN, err := sp.CreateAuthnRequest(requestID, core.ServiceBindingHTTPPost)
+	authN, err := sp.CreateAuthnRequest(requestID, core.ServiceBindingHTTPPost, opt...)
 	if err != nil {
 		return nil, nil, fmt.Errorf(
-			"%s: failed to create authentication request: %w",
+			"%s: failed to create authentication request: %w: %w",
 			op,
 			ErrInternal,
+			err,
 		)
 	}
+	if err := sp.runtime.bindRelayState(requestID, relayState); err != nil {
+		return nil, nil, fmt.Errorf("%s: failed to bind relay state: %w", op, err)
+	}
+	authN.RelayState = relayState
 
 	opts := getAuthnRequestOptions(opt...)
 	payload, err := authN.CreateXMLDocument(opts.indent)
@@ -334,6 +430,10 @@ func (sp *ServiceProvider) AuthnRequestRedirect(
 			err,
 		)
 	}
+	if err := sp.runtime.bindRelayState(requestID, relayState); err != nil {
+		return nil, nil, fmt.Errorf("%s: failed to bind relay state: %w", op, err)
+	}
+	authN.RelayState = relayState
 
 	payload, err := Deflate(authN, opts...)
 	if err != nil {

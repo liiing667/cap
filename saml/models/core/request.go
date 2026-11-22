@@ -21,6 +21,13 @@ type AuthnRequest struct {
 
 	StatusRequestType
 
+	// Audit metadata populated by ServiceProvider.CreateAuthnRequest.  These
+	// fields are not part of the SAML AuthnRequest wire format.
+	RelayState              string   `xml:"-" json:"relay_state,omitempty"`
+	MetadataGeneration      uint64   `xml:"-" json:"metadata_generation,omitempty"`
+	MetadataIssuer          string   `xml:"-" json:"metadata_issuer,omitempty"`
+	CertificateFingerprints []string `xml:"-" json:"certificate_fingerprints,omitempty"`
+
 	Subject              *Subject
 	NameIDPolicy         *NameIDPolicy `xml:",omitempty"`
 	Conditions           *Conditions
