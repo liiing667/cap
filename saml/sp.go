@@ -91,6 +91,8 @@ type ServiceProvider struct {
 	metadata            *metadata.EntityDescriptorIDPSSO
 	metadataCachedUntil *time.Time
 	metadataLock        sync.Mutex
+	metadataSnapshot    *metadataSnapshot
+	runtime             *serviceRuntime
 }
 
 // NewServiceProvider creates a new ServiceProvider.
@@ -110,9 +112,38 @@ func NewServiceProvider(cfg *Config) (*ServiceProvider, error) {
 		)
 	}
 
-	return &ServiceProvider{
-		cfg: cfg,
-	}, nil
+	if cfg.runtime == nil {
+		cfg.runtime = newServiceRuntime()
+	}
+	if cfg.ValidUntil == nil {
+		cfg.ValidUntil = defaultValidUntil
+	}
+	if cfg.GenerateAuthRequestID == nil {
+		cfg.GenerateAuthRequestID = DefaultGenerateAuthRequestID
+	}
+
+	sp := &ServiceProvider{
+		cfg:     cfg,
+		runtime: cfg.runtime,
+	}
+	sp.restoreMetadataSnapshot()
+	return sp, nil
+}
+
+func (sp *ServiceProvider) restoreMetadataSnapshot() {
+	if sp == nil || sp.runtime == nil {
+		return
+	}
+	snap := sp.runtime.currentSnapshot()
+	if snap == nil || snap.sourceKey != metadataSourceKey(sp.cfg) {
+		return
+	}
+	sp.metadata = snap.metadata
+	sp.metadataSnapshot = snap
+	if snap.cachedUntil != nil {
+		cachedUntil := *snap.cachedUntil
+		sp.metadataCachedUntil = &cachedUntil
+	}
 }
 
 // Config returns the service provider config.
@@ -189,8 +220,13 @@ func getIDPMetadataOptions(opt ...Option) idpMetadataOptions {
 // WithCache control whether we should cache IDP Metadata.
 func WithCache(cache bool) Option {
 	return func(o interface{}) {
-		if o, ok := o.(*idpMetadataOptions); ok {
-			o.cache = cache
+		switch opts := o.(type) {
+		case *idpMetadataOptions:
+			opts.cache = cache
+		case *authnRequestOptions:
+			opts.cache = cache
+		case *parseResponseOptions:
+			opts.cache = cache
 		}
 	}
 }
@@ -199,8 +235,13 @@ func WithCache(cache bool) Option {
 // refreshing it fails.
 func WithStale(stale bool) Option {
 	return func(o interface{}) {
-		if o, ok := o.(*idpMetadataOptions); ok {
-			o.useStale = stale
+		switch opts := o.(type) {
+		case *idpMetadataOptions:
+			opts.useStale = stale
+		case *authnRequestOptions:
+			opts.useStale = stale
+		case *parseResponseOptions:
+			opts.useStale = stale
 		}
 	}
 }
@@ -211,12 +252,46 @@ func WithStale(stale bool) Option {
 // - WithCache
 // - WithStale
 func (sp *ServiceProvider) IDPMetadata(opt ...Option) (*metadata.EntityDescriptorIDPSSO, error) {
+	snap, err := sp.idpMetadataSnapshot(opt...)
+	if err != nil {
+		return nil, err
+	}
+	return snap.metadata, nil
+}
+
+// MetadataSnapshot returns the immutable metadata generation currently in use.
+// Options are the same as IDPMetadata.
+func (sp *ServiceProvider) MetadataSnapshot(opt ...Option) (*MetadataSnapshot, error) {
+	snap, err := sp.idpMetadataSnapshot(opt...)
+	if err != nil {
+		return nil, err
+	}
+	return snap.export(), nil
+}
+
+// IDPMetadataSnapshot is an alias for MetadataSnapshot.
+func (sp *ServiceProvider) IDPMetadataSnapshot(opt ...Option) (*MetadataSnapshot, error) {
+	return sp.MetadataSnapshot(opt...)
+}
+
+// MetadataGeneration returns the generation of the current metadata snapshot,
+// or zero when no metadata has been loaded yet.
+func (sp *ServiceProvider) MetadataGeneration() uint64 {
+	if sp == nil {
+		return 0
+	}
+	sp.metadataLock.Lock()
+	defer sp.metadataLock.Unlock()
+	if sp.metadataSnapshot == nil {
+		return 0
+	}
+	return sp.metadataSnapshot.generation
+}
+
+func (sp *ServiceProvider) idpMetadataSnapshot(opt ...Option) (*metadataSnapshot, error) {
 	const op = "saml.ServiceProvider.FetchIDPMetadata"
 
 	opts := getIDPMetadataOptions(opt...)
-
-	var err error
-	var ed *metadata.EntityDescriptorIDPSSO
 
 	isValid := func(md *metadata.EntityDescriptorIDPSSO) bool {
 		if md == nil {
@@ -228,38 +303,85 @@ func (sp *ServiceProvider) IDPMetadata(opt ...Option) (*metadata.EntityDescripto
 		return opts.clock.Now().Before(*md.ValidUntil)
 	}
 
-	isAlive := func(md *metadata.EntityDescriptorIDPSSO, expireAt *time.Time) bool {
-		if md == nil || !opts.cache || expireAt == nil {
+	isValidSnapshot := func(snap *metadataSnapshot) bool {
+		if snap == nil || snap.metadata == nil {
+			return false
+		}
+		if snap.validUntil == nil {
+			return true
+		}
+		return opts.clock.Now().Before(*snap.validUntil)
+	}
+
+	isAlive := func(snap *metadataSnapshot, expireAt *time.Time) bool {
+		if snap == nil || !opts.cache || expireAt == nil {
 			return false
 		}
 
 		return opts.clock.Now().Before(*expireAt)
 	}
 
-	if opts.cache {
-		// We only take the lock when caching is enabled so that requests can be
-		// done concurrently when it is not
-		sp.metadataLock.Lock()
-		defer sp.metadataLock.Unlock()
+	if sp == nil {
+		return nil, fmt.Errorf("%s: missing service provider: %w", op, ErrInternal)
+	}
+	if sp.cfg == nil {
+		return nil, fmt.Errorf("%s: missing service provider config: %w", op, ErrInternal)
+	}
+	if sp.runtime == nil {
+		sp.runtime = newServiceRuntime()
+	}
 
-		switch {
-		case !isValid(sp.metadata):
-			sp.metadata = nil
-			sp.metadataCachedUntil = nil
-		case isValid(sp.metadata) && isAlive(sp.metadata, sp.metadataCachedUntil):
-			return sp.metadata, nil
+	// Metadata state is always guarded. WithCache(false) bypasses the cached
+	// value, but it must not race with a concurrent cached read.
+	sp.metadataLock.Lock()
+	defer sp.metadataLock.Unlock()
+
+	sourceKey := metadataSourceKey(sp.cfg)
+	if sp.metadataSnapshot == nil && sp.metadata != nil {
+		// Reconstruct the snapshot when a caller (or an older code path)
+		// populated only the metadata pointer.
+		snap := newMetadataSnapshot(sp.metadata, opts.clock.Now(), sourceKey)
+		if sp.metadataCachedUntil != nil {
+			cachedUntil := *sp.metadataCachedUntil
+			snap.cachedUntil = &cachedUntil
+		}
+		sp.metadataSnapshot = sp.runtime.installSnapshot(snap)
+		if sp.metadataSnapshot.cachedUntil != nil {
+			cachedUntil := *sp.metadataSnapshot.cachedUntil
+			sp.metadataCachedUntil = &cachedUntil
 		}
 	}
+	if sp.metadataSnapshot != nil && sp.metadataSnapshot.sourceKey != sourceKey {
+		// A configuration change points at a different metadata source. Never
+		// serve the previous source's issuer/certificate pair.
+		sp.metadata = nil
+		sp.metadataSnapshot = nil
+		sp.metadataCachedUntil = nil
+	}
+
+	if opts.cache {
+		switch {
+		case !isValidSnapshot(sp.metadataSnapshot):
+			sp.metadata = nil
+			sp.metadataSnapshot = nil
+			sp.metadataCachedUntil = nil
+		case isValidSnapshot(sp.metadataSnapshot) && isAlive(sp.metadataSnapshot, sp.metadataCachedUntil):
+			return sp.metadataSnapshot, nil
+		}
+	}
+
+	var err error
+	var ed *metadata.EntityDescriptorIDPSSO
 
 	// Order of switch case determines IDP metadata config precedence
 	switch {
 	case sp.cfg.MetadataURL != "":
 		ed, err = fetchIDPMetadata(sp.cfg.MetadataURL)
 		switch {
-		case err != nil && opts.useStale && isValid(sp.metadata):
+		case err != nil && opts.useStale && isValidSnapshot(sp.metadataSnapshot):
 			// An error occurred but we have a cached metadata document that
 			// we can use
-			return sp.metadata, nil
+			return sp.metadataSnapshot, nil
 		case err != nil:
 			return nil, fmt.Errorf("%s: %w", op, err)
 		}
@@ -281,36 +403,22 @@ func (sp *ServiceProvider) IDPMetadata(opt ...Option) (*metadata.EntityDescripto
 	}
 
 	if !isValid(ed) {
+		if opts.useStale && isValidSnapshot(sp.metadataSnapshot) {
+			return sp.metadataSnapshot, nil
+		}
 		return nil, fmt.Errorf("the IDP configuration was only valid until %s", ed.ValidUntil.Format(time.RFC3339))
 	}
 
+	snap := sp.runtime.installSnapshot(newMetadataSnapshot(ed, opts.clock.Now(), sourceKey))
 	sp.metadata = ed
+	sp.metadataSnapshot = snap
 	sp.metadataCachedUntil = nil
-	if sp.metadata.CacheDuration != nil {
-		cachedUntil := opts.clock.Now().Add(time.Duration(*sp.metadata.CacheDuration))
+	if snap.cachedUntil != nil {
+		cachedUntil := *snap.cachedUntil
 		sp.metadataCachedUntil = &cachedUntil
 	}
 
-	return ed, err
-}
-
-func (sp *ServiceProvider) destination(binding core.ServiceBinding) (string, error) {
-	const op = "saml.ServiceProvider.destination"
-
-	meta, err := sp.IDPMetadata()
-	if err != nil {
-		return "", fmt.Errorf("%s: failed to fetch metadata: %w", op, err)
-	}
-
-	destination, ok := meta.GetLocationForBinding(binding)
-	if !ok {
-		return "", fmt.Errorf(
-			"%s: no location for provided binding (%s) found: %w",
-			op, binding, ErrBindingUnsupported,
-		)
-	}
-
-	return destination, nil
+	return snap, nil
 }
 
 func fetchIDPMetadata(metadataURL string) (*metadata.EntityDescriptorIDPSSO, error) {
@@ -318,6 +426,7 @@ func fetchIDPMetadata(metadataURL string) (*metadata.EntityDescriptorIDPSSO, err
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch identity provider metadata: %w", err)
 	}
+	defer res.Body.Close()
 
 	raw, err := io.ReadAll(res.Body)
 	if err != nil {
@@ -325,6 +434,17 @@ func fetchIDPMetadata(metadataURL string) (*metadata.EntityDescriptorIDPSSO, err
 	}
 
 	meta, err := parseIDPMetadata(raw)
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		if err != nil {
+			// Preserve the parse error for error bodies that are not a
+			// metadata document.
+			return nil, err
+		}
+		return nil, fmt.Errorf(
+			"failed to fetch identity provider metadata: unexpected HTTP status %s",
+			res.Status,
+		)
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -52,6 +52,10 @@ type Config struct {
 
 	// GenerateAuthRequestID generates an XSD:ID conforming ID.
 	GenerateAuthRequestID GenerateAuthRequestIDFunc
+
+	// runtime holds state that must survive ServiceProvider recreation, such as
+	// the last complete metadata snapshot and pending authentication requests.
+	runtime *serviceRuntime
 }
 
 // MetadataParameters are parameters that are required for SAML federation.
@@ -159,9 +163,13 @@ func NewConfig(entityID, acs, metadataURL string, opt ...Option) (*Config, error
 		AssertionConsumerServiceURL: acs,
 		MetadataURL:                 metadataURL,
 		MetadataXML:                 opts.withMetadataXML,
-		MetadataParameters:          opts.withMetadataParameters,
 		ValidUntil:                  opts.withValidUntil,
 		GenerateAuthRequestID:       opts.withGenerateAuthRequestID,
+		runtime:                     newServiceRuntime(),
+	}
+	if opts.withMetadataParameters != nil {
+		metadataParameters := *opts.withMetadataParameters
+		cfg.MetadataParameters = &metadataParameters
 	}
 
 	err := cfg.Validate()

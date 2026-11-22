@@ -11,6 +11,20 @@ import (
 // See 3.3.3 http://docs.oasis-open.org/security/saml/v2.0/saml-core-2.0-os.pdf
 type Response struct {
 	types.Response
+
+	// The fields below are audit metadata populated by ParseResponse. They are
+	// deliberately excluded from XML so the SAML payload itself is not altered
+	// when a Response is re-serialized.
+	RequestID               string   `xml:"-" json:"request_id,omitempty"`
+	RelayState              string   `xml:"-" json:"relay_state,omitempty"`
+	RelayStateDigest        string   `xml:"-" json:"relay_state_digest,omitempty"`
+	Generation              uint64   `xml:"-" json:"generation,omitempty"`
+	RequestGeneration       uint64   `xml:"-" json:"request_generation,omitempty"`
+	TabGeneration           uint64   `xml:"-" json:"tab_generation,omitempty"`
+	MetadataIssuer          string   `xml:"-" json:"metadata_issuer,omitempty"`
+	MetadataGeneration      uint64   `xml:"-" json:"metadata_generation,omitempty"`
+	CertificateFingerprints []string `xml:"-" json:"certificate_fingerprints,omitempty"`
+	RejectionStage          string   `xml:"-" json:"rejection_stage,omitempty"`
 }
 
 // Assertions returns the assertions in the Response.

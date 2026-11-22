@@ -187,15 +187,10 @@ func (p *TestProvider) SetExpectedBase64EncodedSAMLRequest(sr string) {
 	p.expectedB64EncSAMLRequest = sr
 }
 
-// StartTestProvider starts a new identity provider for testing.
-// The metadata XML is served at the "/saml/metadata" path.
-// The server URL can be obtained by calling the ServerURL() method.
-//
-// The metadata XML contains the HTTP-Post and Redirect sign-on endpoints.
-// The sign-on endpoints will validate the incoming requests on their correctness.
-// The SAMLResponse, RelayState, and Destination URL will be returned in a JSON file,
-// that can be unmarshalled into testprovider.SAMLResponsePostData.
-func StartTestProvider(t *testing.T) *TestProvider {
+// NewTestProvider creates an in-process identity provider without starting an
+// HTTP server. It is useful for tests that only need metadata and signed
+// responses and cannot bind a local network socket.
+func NewTestProvider(t *testing.T) *TestProvider {
 	t.Helper()
 	r := require.New(t)
 
@@ -218,6 +213,22 @@ func StartTestProvider(t *testing.T) *TestProvider {
 	}
 
 	provider.defaults()
+	return provider
+}
+
+// StartTestProvider starts a new identity provider for testing.
+// The metadata XML is served at the "/saml/metadata" path.
+// The server URL can be obtained by calling the ServerURL() method.
+//
+// The metadata XML contains the HTTP-Post and Redirect sign-on endpoints.
+// The sign-on endpoints will validate the incoming requests on their correctness.
+// The SAMLResponse, RelayState, and Destination URL will be returned in a JSON file,
+// that can be unmarshalled into testprovider.SAMLResponsePostData.
+func StartTestProvider(t *testing.T) *TestProvider {
+	t.Helper()
+
+	provider := NewTestProvider(t)
+	m := provider.metadata
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/saml/metadata", provider.metadataHandler)
@@ -229,9 +240,19 @@ func StartTestProvider(t *testing.T) *TestProvider {
 
 	server.Start()
 
-	overrideSSOLocations(server.URL, &m)
+	overrideSSOLocations(server.URL, m)
 
 	return provider
+}
+
+// MetadataXML returns the provider metadata as an XML document.
+func (p *TestProvider) MetadataXML(t *testing.T) string {
+	t.Helper()
+	r := require.New(t)
+
+	raw, err := xml.Marshal(p.metadata)
+	r.NoError(err)
+	return string(raw)
 }
 
 func overrideSSOLocations(serverURL string, metadata *metadata.EntityDescriptorIDPSSO) {
@@ -251,7 +272,9 @@ func overrideSSOLocations(serverURL string, metadata *metadata.EntityDescriptorI
 
 // Close shut downs the server and waits for all requests to complete.
 func (p *TestProvider) Close() {
-	p.server.Close()
+	if p.server != nil {
+		p.server.Close()
+	}
 }
 
 // ServerURL returns the test server URL.

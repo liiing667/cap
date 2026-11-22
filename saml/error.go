@@ -16,4 +16,11 @@ var (
 	ErrMissingSubject       = errors.New("subject missing")
 	ErrMissingAttributeStmt = errors.New("attribute statement missing")
 	ErrInvalidSignature     = errors.New("invalid signature")
+
+	ErrRequestStateMissing    = errors.New("saml request state missing")
+	ErrRequestStateConsumed   = errors.New("saml request state already consumed")
+	ErrRequestStateCancelled  = errors.New("saml request state cancelled")
+	ErrRequestStateMismatch   = errors.New("saml request state mismatch")
+	ErrRequestStateExpired    = errors.New("saml request state expired")
+	ErrRequestStateIncomplete = errors.New("saml request state incomplete")
 )
